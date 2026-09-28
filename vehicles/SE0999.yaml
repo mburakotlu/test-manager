@@ -1,0 +1,35 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0999
+vin: WP1ZZZXA1RL200117
+series: H2
+market: ECE
+scope: SQ5 Update
+tec_pc: ''
+tests:
+  - name: "Update auf SQ3"
+    period: "KW08-2026"
+    template: daily_enna
+  - name: "Wiederholung W-2 bzw. Einbuchung in W-1"
+    period: "KW09-2026"
+    template: daily_enna
+  - name: "Wiederholung W-2 bzw. Einbuchung in W-1"
+    period: "KW10-2026"
+    template: daily_enna
+  - name: "HCP3 Wecken über Backend PreProd"
+    period: "KW16-2026"
+    template: daily_enna
+  - name: "MR: Dauer-Repro (Erprobung) / ECU.Precons.Failed"
+    period: "KW17-2026"
+    template: daily_enna
+  - name: "MR: Dauer-Repro (Erprobung) / ECU.Precons.Failed"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "MR: Dauer-Repro (Erprobung) / ECU.Precons.Failed"
+    period: "KW20-2026"
+    template: daily_enna
+  - name: "Max Erpr"
+    period: "KW22-2026"
+    template: daily_enna
+  - name: "SQ5"
+    period: "KW30-2026"
+    template: daily_enna

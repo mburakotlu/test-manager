@@ -1,0 +1,112 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0809
+vin: WP1ZZZX14TD150167
+series: E4
+market: ECE
+scope: HCP3/4/5/ConMod/PASD R4.1
+tec_pc: ''
+tests:
+  - name: "GOBW+Vorbereitung Funktionale Absicherung"
+    period: "KW04-2026"
+    template: daily_enna
+  - name: "---"
+    period: "KW04-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW05-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW05-2026"
+    template: daily_enna
+  - name: "WEE Funktionale Absicherung"
+    period: "KW05-2026"
+    template: daily_enna
+  - name: "Funktionale Absicherung"
+    period: "KW06-2026"
+    template: daily_enna
+  - name: "WEE MR"
+    period: "KW06-2026"
+    template: daily_enna
+  - name: "Funktionale Absicherung"
+    period: "KW07-2026"
+    template: daily_enna
+  - name: "Update auf R4.1"
+    period: "KW08-2026"
+    template: daily_enna
+  - name: "WEE MR"
+    period: "KW08-2026"
+    template: daily_enna
+  - name: "WEE SR"
+    period: "KW09-2026"
+    template: daily_enna
+  - name: "Check gegen SOP BL R3.1 / evt. Übergabe an EWI bei großen Abwiechungen"
+    period: "KW10-2026"
+    template: daily_enna
+  - name: "funktionale Absicherung Kompatibilität R4.1 auf R3.1"
+    period: "KW12-2026"
+    template: daily_enna
+  - name: "funktionale Absicherung Kompatibilität R4.1 auf R3.1"
+    period: "KW13-2026"
+    template: daily_enna
+  - name: "funktionale Absicherung Kompatibilität R4.1 auf R3.1"
+    period: "KW14-2026"
+    template: daily_enna
+  - name: "WEE Selina"
+    period: "KW16-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW17-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "WEE Stefan Kramer"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "Erprobung Benelux"
+    period: "KW19-2026"
+    template: daily_enna
+  - name: "WEE Selina"
+    period: "KW19-2026"
+    template: daily_enna
+  - name: "DLCM Erprobung Block1 E4/MIB4"
+    period: "KW21-2026"
+    template: daily_enna
+  - name: "MR WEE"
+    period: "KW22-2026"
+    template: daily_enna
+  - name: "Christoph WEE"
+    period: "KW23-2026"
+    template: daily_enna
+  - name: "Yannic"
+    period: "KW25-2026"
+    template: daily_enna
+  - name: "Malte (+ VR Update in Rut)"
+    period: "KW28-2026"
+    template: daily_enna
+  - name: "Christoph Meyer WEE"
+    period: "KW29-2026"
+    template: daily_enna
+  - name: "Malte"
+    period: "KW30-2026"
+    template: daily_enna
+  - name: "Yannic Wee"
+    period: "KW32-2026"
+    template: daily_enna
+  - name: "WEE Christoph"
+    period: "KW34-2026"
+    template: daily_enna
+  - name: "WEE Simon"
+    period: "KW36-2026"
+    template: daily_enna
+  - name: "Vorbereitung für GQ Vorstellung"
+    period: "KW39-2026"
+    template: daily_enna
+    ticket: PHUB-2278
+history:

@@ -1,0 +1,17 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0977
+vin: WP1ZZZXA7RL200235
+series: H2
+market: ECE
+scope: ''
+tec_pc: ''
+tests:
+  - name: "IBP Automation"
+    period: "KW17-2026"
+    template: daily_enna
+  - name: "IBP Automation"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "IBP Automation"
+    period: "KW18-2026"
+    template: daily_enna

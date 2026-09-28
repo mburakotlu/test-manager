@@ -1,0 +1,12 @@
+.venv/
+.venv-1/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.auth/
+.vscode/mcp.json

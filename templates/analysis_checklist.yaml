@@ -1,0 +1,19 @@
+# Imported manually from Jira Smart Checklist plugin (project template group: PFC_DoD, template ID 1798).
+# Item order matches the plugin's UI; all items start unchecked.
+name: AnalysisCheckList
+source: "Jira Smart Checklist plugin template, PFC_DoD group, ID 1798"
+items:
+  - text: Review Campaign Settings
+    checked: false
+  - text: Review SDB-Services
+    checked: false
+  - text: Review Availability n.i.O on the DLCM HeatMap
+    checked: false
+  - text: Analyse UpdateTimeLine and Boundary intervals
+    checked: false
+  - text: Analyse OnboardLogs
+    checked: false
+  - text: DLCM Review
+    checked: false
+  - text: BasisService Review if necessary
+    checked: false

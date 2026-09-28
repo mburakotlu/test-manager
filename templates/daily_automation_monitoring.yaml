@@ -1,0 +1,11 @@
+# Imported manually from Jira Smart Checklist plugin (project template group: PFC_DoD, template ID 1805).
+# Item order matches the plugin's UI; all items start unchecked.
+name: Daily Automation Monitoring
+source: "Jira Smart Checklist plugin template, PFC_DoD group, ID 1805"
+items:
+  - text: Check Results on the Prozessor Side for the Testobject
+    checked: false
+  - text: check availibility of the tests on the HeatMap
+    checked: false
+  - text: extract the vehicle Incidents and write them down (aborted, cancelled, failed)
+    checked: false

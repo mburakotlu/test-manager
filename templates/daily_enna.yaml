@@ -1,0 +1,31 @@
+# Cascaded checklist: rendered as one "# {week}.{day}" chapter per day, each
+# containing these groups as nested "## Group Name" sub-chapters (see
+# render_cascaded_checklist in jira_agent/checklist.py). Combines the same
+# content previously split across daily_maintenance_enna.yaml +
+# daily_automation_monitoring.yaml (kept separately only because
+# generate_weekly_tickets.py still loads them individually).
+name: Daily Enna Routine
+source: "Jira Smart Checklist plugin templates, PFC_DoD group, IDs 1804+1805 (combined)"
+groups:
+  - name: Daily Maintenance Enna TestSystem/object
+    items:
+      - text: Stop the Tests on Tec PC
+        checked: false
+      - text: Restart Tec PC
+        checked: false
+      - text: Delete unneeded Logs and Reports
+        checked: false
+      - text: ReadOut Pudis from Car Via Enna
+        checked: false
+      - text: Check the Car for relevant failures
+        checked: false
+      - text: document relevant failures and activities on the Jira responding Object
+        checked: false
+  - name: Daily Automation Monitoring
+    items:
+      - text: Check Results on the Prozessor Side for the Testobject
+        checked: false
+      - text: check availibility of the tests on the HeatMap
+        checked: false
+      - text: extract the vehicle Incidents and write them down (aborted, cancelled, failed)
+        checked: false

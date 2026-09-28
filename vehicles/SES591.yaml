@@ -1,0 +1,14 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SES591
+vin: WP1ZZZXA6RL000303
+series: H2
+market: ECE
+scope: abgegeben am 17.08 an EWI
+tec_pc: ''
+tests:
+  - name: "VR-Check&Update"
+    period: "KW28-2026"
+    template: daily_enna
+  - name: "Rückgabe an EVI4"
+    period: "KW34-2026"
+    template: daily_enna

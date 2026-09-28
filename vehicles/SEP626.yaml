@@ -1,0 +1,100 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SEP626
+vin: WP1BB2X10TD300014
+series: E4
+market: US
+scope: HCP3/4/5/ConMod/PASD R3.1 NI2SQ3 - US funktioniert nicht auf Live in De
+tec_pc: CP303777
+tests:
+  - name: "GOBW+Vorbereitung Automation"
+    period: "KW04-2026"
+    template: daily_enna
+  - name: "GOBW+Vorbereitung Automation"
+    period: "KW05-2026"
+    template: daily_enna
+  - name: "Vorbereitung der Automation HCP3+ConMod"
+    period: "KW06-2026"
+    template: daily_enna
+  - name: "Vorbereitung der Automation HCP3+ConMod"
+    period: "KW07-2026"
+    template: daily_enna
+  - name: "Vorbereitung der Automation HCP3+ConMod"
+    period: "KW08-2026"
+    template: daily_enna
+  - name: "Vorbereitung der Automation HCP3+ConMod"
+    period: "KW09-2026"
+    template: daily_enna
+  - name: "Vorbereitung der Automation HCP3+ConMod"
+    period: "KW10-2026"
+    template: daily_enna
+  - name: "Vorbereitung Autom HCP3+ConMod"
+    period: "KW11-2026"
+    template: daily_enna
+  - name: "Vorbereitung Autom HCP3+ConMod"
+    period: "KW12-2026"
+    template: daily_enna
+  - name: "Autom. HCP3/HCP4/HCP5/ConMod"
+    period: "KW16-2026"
+    template: daily_enna
+  - name: "Autom. HCP3/HCP4/HCP5/ConMod"
+    period: "KW17-2026"
+    template: daily_enna
+  - name: "Autom. HCP3/HCP4/HCP5/ConMod"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "Autom. HCP3/HCP4/HCP5/ConMod"
+    period: "KW19-2026"
+    template: daily_enna
+  - name: "Autom. HCP3/HCP4/HCP5/ConMod"
+    period: "KW20-2026"
+    template: daily_enna
+  - name: "Automatisierung / x->x / HCP3/5/ConMod/PASD (ohne HCP4)"
+    period: "KW22-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW24-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW25-2026"
+    template: daily_enna
+  - name: "Defekt: Warten auf Werkstatt Termin"
+    period: "KW27-2026"
+    template: daily_enna
+  - name: "Defekt: Warten auf Werkstatt Termin"
+    period: "KW28-2026"
+    template: daily_enna
+  - name: "Defekt: Warten auf Werkstatt Termin"
+    period: "KW29-2026"
+    template: daily_enna
+  - name: "Werkstatt: PWR Tausch"
+    period: "KW30-2026"
+    template: daily_enna
+  - name: "Werkstatt: PWR Tausch"
+    period: "KW31-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW32-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW33-2026"
+    template: daily_enna
+  - name: "US Roaming Aktivierung neuer ConMod"
+    period: "KW34-2026"
+    template: daily_enna
+  - name: "US Roaming Aktivierung neuer ConMod"
+    period: "KW35-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW36-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW37-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW38-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW39-2026"
+    template: daily_enna
+    ticket: PHUB-2279
+history:

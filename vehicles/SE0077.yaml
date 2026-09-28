@@ -1,0 +1,50 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0077
+vin: WP1ZZZXA3RL200247
+series: H2
+market: ECE
+scope: ''
+tec_pc: ''
+tests:
+  - name: "EVI / Gesamtfahrzeugabsicherung"
+    period: "KW49-2025"
+    template: daily_enna
+  - name: "EVI / Gesamtfahrzeugabsicherung"
+    period: "KW50-2025"
+    template: daily_enna
+  - name: "EVI / Gesamtfahrzeugabsicherung"
+    period: "KW51-2025"
+    template: daily_enna
+  - name: "Jahreswechsel-Erprobung / HCP3 TTT Funktionale Absicherung / X->X manuelle Tests"
+    period: "KW52-2025"
+    template: daily_enna
+  - name: "Jahreswechsel-Erprobung / HCP3 TTT Funktionale Absicherung / X->X manuelle Tests"
+    period: "KW01-2026"
+    template: daily_enna
+  - name: "Jahreswechsel-Erprobung / HCP3 TTT Funktionale Absicherung / X->X manuelle Tests"
+    period: "KW02-2026"
+    template: daily_enna
+  - name: "Auf SQ3 hochziehen"
+    period: "KW06-2026"
+    template: daily_enna
+  - name: "Reproduktion Corner Case: / ORU -> GOBW"
+    period: "KW08-2026"
+    template: daily_enna
+  - name: "Reproduktion Corner Case: / ORU -> GOBW"
+    period: "KW09-2026"
+    template: daily_enna
+  - name: "Reproduktion Corner Case: / ORU -> GOBW"
+    period: "KW10-2026"
+    template: daily_enna
+  - name: "Einbuchung in W-1"
+    period: "KW11-2026"
+    template: daily_enna
+  - name: "Einbuchung in W-1"
+    period: "KW12-2026"
+    template: daily_enna
+  - name: "Welle -1 TTT durchgeführt; / Welle -2 SQ4 GOBW durchgeführt"
+    period: "KW13-2026"
+    template: daily_enna
+  - name: "WEE"
+    period: "KW17-2026"
+    template: daily_enna

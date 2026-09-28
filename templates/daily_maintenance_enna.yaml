@@ -1,0 +1,17 @@
+# Imported manually from Jira Smart Checklist plugin (project template group: PFC_DoD, template ID 1804).
+# Item order matches the plugin's UI; all items start unchecked.
+name: Daily Maintenance Enna TestSystem/object
+source: "Jira Smart Checklist plugin template, PFC_DoD group, ID 1804"
+items:
+  - text: Stop the Tests on Tec PC
+    checked: false
+  - text: Restart Tec PC
+    checked: false
+  - text: Delete unneeded Logs and Reports
+    checked: false
+  - text: ReadOut Pudis from Car Via Enna
+    checked: false
+  - text: Check the Car for relevant failures
+    checked: false
+  - text: document relevant failures and activities on the Jira responding Object
+    checked: false

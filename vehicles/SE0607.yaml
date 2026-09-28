@@ -1,0 +1,75 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0607
+key: PHUB-444909
+vin: WP1ZZZX16TD300022
+series: E4
+market: ECE
+scope: HCP3/4/5/ConMod R4.1
+tec_pc: CP303778
+tests:
+  - name: "Autom. HCP3 LUM-Error / x->x (x->y)"
+    period: "KW16-2026"
+    template: daily_enna
+  - name: "Autom. HCP3 LUM-Error / x->x (x->y)"
+    period: "KW17-2026"
+    template: daily_enna
+  - name: "Autom. HCP3 LUM-Error / x->x (x->y)"
+    period: "KW18-2026"
+    template: daily_enna
+  - name: "Erprobung Benelux"
+    period: "KW19-2026"
+    template: daily_enna
+  - name: "WEE Simon"
+    period: "KW20-2026"
+    template: daily_enna
+  - name: "Automatisierung / x->x / HCP3/4/5/ConMod/PASD"
+    period: "KW22-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW24-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW25-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW26-2026"
+    template: daily_enna
+  - name: "Klimakammer"
+    period: "KW27-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW28-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW29-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod"
+    period: "KW32-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod + IoT Check"
+    period: "KW33-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod + IoT Check"
+    period: "KW34-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod/RSAD"
+    period: "KW35-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod/RSAD"
+    period: "KW36-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod/RSAD"
+    period: "KW37-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod/RSAD"
+    period: "KW38-2026"
+    template: daily_enna
+  - name: "Automation HCP3/4/5/ConMod/RSAD"
+    period: "KW39-2026"
+    template: daily_enna
+    ticket: PHUB-2257
+  - name: "Automation HCP3/4/5/ConMod/RSAD"
+    period: "KW40-2026"
+    template: daily_enna
+    ticket: PHUB-2258
+history:

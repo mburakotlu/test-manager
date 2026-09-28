@@ -1,0 +1,44 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0483
+vin: WP1ZZZXA2RL000198
+series: H2
+market: ECE
+scope: ''
+tec_pc: ''
+tests:
+  - name: "offen, ob SQ2 als Absprung dient"
+    period: "KW02-2026"
+    template: daily_enna
+  - name: "Auf SQ3 hochziehen"
+    period: "KW06-2026"
+    template: daily_enna
+  - name: "Welle -2 TTT (mit WWS Adapter)"
+    period: "KW07-2026"
+    template: daily_enna
+  - name: "WEE MG"
+    period: "KW09-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW13-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW13-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW13-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW13-2026"
+    template: daily_enna
+  - name: "x"
+    period: "KW13-2026"
+    template: daily_enna
+history:
+  - date: "2026-09-09"
+    activity: "test"
+    description: "test"
+    ticket: PHUB-2208
+  - date: "2026-09-09"
+    activity: "test"
+    description: "test"
+    ticket: PHUB-2209

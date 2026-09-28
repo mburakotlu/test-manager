@@ -1,0 +1,47 @@
+# Source: Confluence 'Uebersicht DLCM Flotte' (PHUB space). Credentials/SPINs deliberately excluded.
+label: SE0534
+vin: WP1ZZZXA4RL000140
+series: H2
+market: ECE
+scope: geplante SQ5 Absicherung
+tec_pc: ''
+tests:
+  - name: "Zagreb Erprobung"
+    period: "KW42-2025"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT"
+    period: "KW47-2025"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT"
+    period: "KW48-2025"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT"
+    period: "KW51-2025"
+    template: daily_enna
+  - name: "offen ob Automatisierung über Jahreswechsel möglich"
+    period: "KW52-2025"
+    template: daily_enna
+  - name: "offen ob Automatisierung über Jahreswechsel möglich"
+    period: "KW01-2026"
+    template: daily_enna
+  - name: "offen ob Automatisierung über Jahreswechsel möglich"
+    period: "KW02-2026"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT 4475"
+    period: "KW04-2026"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT 4475"
+    period: "KW05-2026"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT 4475"
+    period: "KW06-2026"
+    template: daily_enna
+  - name: "Autom HCP3 SQ4 TTT 4475"
+    period: "KW07-2026"
+    template: daily_enna
+  - name: "IBN nach HCP3 Tausch"
+    period: "KW16-2026"
+    template: daily_enna
+  - name: "IBN nach HCP3 Tausch"
+    period: "KW17-2026"
+    template: daily_enna

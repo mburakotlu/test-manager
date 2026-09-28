@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "jira-agent": {
+      "command": "python",
+      "args": ["-m", "jira_agent.server"],
+      "cwd": "**Update with your workspace root path, e.g. C:\\\\Users\\\\you\\\\Desktop\\\\Repos\\\\jira_manager**",
+      "env": {
+        "JIRA_BASE_URL": "https://api.skyway.porsche.com",
+        "JIRA_EMAIL": "**Update with your email**",
+        "JIRA_API_TOKEN": "**Update with your API token — never commit a real value**",
+        "JIRA_AUTH_MODE": "bearer",
+        "JIRA_IS_TEC_NET": "false",
+        "JIRA_VERIFY_SSL": "false",
+        "WORKSPACE_ROOT": "**Update with your workspace root path**"
+      }
+    }
+  }
+}

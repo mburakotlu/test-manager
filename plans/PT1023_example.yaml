@@ -1,0 +1,8 @@
+# Example vehicle test plan — mirrors the real Insight "Planung" object type
+# (schema PEDSFLEET, id 481). Edit/copy this file per vehicle per sprint.
+vehicle: PT1023
+sprint: KW37
+activities:
+  - name: "X2X Update HCP3"
+    description: "Perform X2X update on the HCP3 hardware component and verify onboard status."
+    template: analysis_checklist
