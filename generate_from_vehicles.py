@@ -1,9 +1,7 @@
 """Generate one ticket per assigned test, across all (or selected) vehicles.
 
-Reads vehicles/*.yaml (see jira_agent/vehicle.py) — each vehicle can carry a queue
-of assigned tests, each with its own planned period (sprint) and checklist
-template. This is the consolidated successor to generate_from_plan.py: instead of
-separate plan files, tests live directly on the vehicle that owns them.
+Reads the ordered Tests, Testplanung (KW), and Tickets fields on FZG Assets.
+Each assigned test has its planned period and a matching ticket slot.
 
 Checklists are written via the browser-automation workaround (see
 jira_agent/browser_checklist.py) since the Smart Checklist field can't be set
@@ -14,7 +12,7 @@ One-time setup (if not already done):
 
 Usage:
     python generate_from_vehicles.py [--vehicles "SE0400,SE0607"] [--period "KW37"]
-        [--vehicles-dir vehicles] [--project PHUB] [--issue-type Task]
+        [--project PHUB] [--issue-type Task]
         [--confirm] [--headed]
 
 Dry-run by default: prints the full plan (tickets to create + checklist previews)
@@ -31,25 +29,26 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from dotenv import load_dotenv
 
 from jira_agent.browser_checklist import write_checklists_via_browser
 from jira_agent.checklist import render_test_checklist
 from jira_agent.config import load_config
 from jira_agent.jira_client import JiraClient
-from jira_agent.vehicle import load_vehicles, save_vehicle_tests, vehicle_link_fields
+from jira_agent.vehicle import vehicle_link_fields
+from jira_agent.asset_vehicles import load_asset_vehicles, save_asset_tickets, ticket_attribute_id
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
-VEHICLES_DIR = Path(__file__).parent / "vehicles"
 
 
 def main() -> None:
     """Parse CLI args, build the ticket plan from vehicle test queues, and preview/execute it."""
+    load_dotenv(Path(__file__).parent / ".env")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--vehicles", help="Comma-separated vehicle labels to include (default: all)")
     parser.add_argument("--period", help='Only include tests planned for this period, e.g. "KW37" (default: all periods)')
     parser.add_argument("--periods", help='Comma-separated list of periods to include, e.g. "KW38-2026,KW39-2026" (default: all periods)')
     parser.add_argument("--sprint", help="Free-text sprint label for the created tickets (default: derived from the matched periods)")
-    parser.add_argument("--vehicles-dir", default=str(VEHICLES_DIR), help="Directory of local vehicle YAML files (default: vehicles/)")
     parser.add_argument("--project", default="PHUB", help="Jira project key (default: PHUB)")
     parser.add_argument("--issue-type", default="Task", help="Jira issue type name (default: Task)")
     parser.add_argument("--confirm", action="store_true", help="Actually create tickets + write checklists (default: dry-run only)")
@@ -58,16 +57,13 @@ def main() -> None:
     parser.add_argument("--board-id", type=int, default=114663, help="Agile board id to create/reuse the sprint on (default: 114663, DLCM_Integration/Automation)")
     args = parser.parse_args()
 
-    vehicles = load_vehicles(args.vehicles_dir)
-    if args.vehicles:
-        wanted = {v.strip() for v in args.vehicles.split(",") if v.strip()}
-        vehicles = [v for v in vehicles if v.label in wanted]
-
     wanted_periods = {p.strip() for p in args.periods.split(",") if p.strip()} if args.periods else None
 
     config = load_config()
     client = JiraClient(config)
     try:
+        wanted = {v.strip() for v in args.vehicles.split(",") if v.strip()} if args.vehicles else None
+        vehicles = load_asset_vehicles(client, labels=wanted)
         built = []
         skipped_existing = 0
         for vehicle in vehicles:
@@ -120,7 +116,7 @@ def main() -> None:
 
         created: list[tuple[str, str]] = []
         created_labels: dict[str, str] = {}
-        touched_vehicles = {}
+        tickets_id = ticket_attribute_id(client, create=True)
         for vehicle, test, _template, summary, description, checklist, sprint_label in built:
             result = client.create_issue(
                 args.project, args.issue_type, summary, description, confirm=True,
@@ -130,15 +126,8 @@ def main() -> None:
             created.append((key, checklist))
             created_labels[key] = sprint_label
             test.ticket = key
-            touched_vehicles[vehicle.label] = vehicle
+            save_asset_tickets(client, vehicle, tickets_id)
             print(f"Created {key}: {summary}")
-
-        # Persist ticket keys BEFORE the checklist step, which can throw (e.g. expired
-        # browser session) — otherwise real tickets get created but never recorded locally.
-        print("Persisting ticket keys back to vehicle YAML files...")
-        for vehicle in touched_vehicles.values():
-            save_vehicle_tests(vehicle)
-            print(f"  Updated {vehicle.source_path}")
 
         if not args.no_sprint_assignment:
             print(f"Assigning tickets to their Agile sprint (board {args.board_id})...")

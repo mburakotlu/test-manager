@@ -10,3 +10,5 @@ __pycache__/
 .ruff_cache/
 .auth/
 .vscode/mcp.json
+build/
+dist/

@@ -21,28 +21,30 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 
-import yaml
 from dotenv import load_dotenv
 from flask import Flask, request, url_for
+from app_paths import APP_DIR
 
 # Loaded here (not just in main.py) so `python webapp.py` also works without
 # manually exporting env vars into the shell first.
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(APP_DIR / ".env")
 
 from jira_agent.browser_checklist import write_checklists_via_browser
 from jira_agent.checklist import render_test_checklist
 from jira_agent.config import load_config
 from jira_agent.jira_client import JiraClient
+from jira_agent.asset_vehicles import (
+    history_attribute_id, load_asset_vehicles, save_asset_history,
+    save_asset_tickets, ticket_attribute_id,
+)
 from jira_agent.register import RegisterEntry, append_entry, load_entries
-from jira_agent.vehicle import HistoryEntry, clear_ticket_reference, load_vehicle, load_vehicles, save_vehicle_history, save_vehicle_tests, vehicle_link_fields
+from jira_agent.vehicle import HistoryEntry, clear_ticket_reference, vehicle_link_fields
 from import_jahreskalender import import_calendar
 from sync_tests_to_insight import sync_all
 
-VEHICLES_DIR = Path(__file__).parent / "vehicles"
-TEMPLATES_DIR = Path(__file__).parent / "templates"
+TEMPLATES_DIR = APP_DIR / "templates"
 DEFAULT_BOARD_ID = 114663  # DLCM_Integration/Automation
-DEFAULT_XLSX = Path(__file__).parent / "DLCM_FZG_Planung.xlsx"
-REPO_TICKET = "PHUB-2200"  # "Jira-Manager" Xray Test Repository reference ticket
+DEFAULT_XLSX = APP_DIR / "DLCM_FZG_Planung.xlsx"
 ACTIVITY_SUGGESTIONS = ["HW change", "PUDIS ziehen", "Charging", "Test"]
 PRIORITIES = ["Highest", "High", "Medium", "Low", "Lowest"]
 PRIORITY_COLORS = {"Highest": "#c0392b", "High": "#e67e22", "Medium": "#d4ac0d", "Low": "#2e86c1", "Lowest": "#7f8c8d"}
@@ -116,7 +118,7 @@ function setVehicleChecks(button, checked) {{
 </script>
 </head>
 <body>
-<nav><a href="{index_url}">Create Activity</a> <a href="{sprint_url}">Generate Sprint Tickets</a> <a href="{refresh_url}">Refresh from Excel</a> <a href="{history_url}">History Overview</a> <a href="{comment_url}">Add Comment</a> <a href="{delete_ticket_url}">Delete Ticket</a> <a href="{register_url}">Edit Register</a> <a href="{repo_url}">Test Repo Files</a> <a href="{log_url}">Activity Log</a></nav>
+<nav><a href="{index_url}">Create Activity</a> <a href="{sprint_url}">Generate Sprint Tickets</a> <a href="{refresh_url}">Refresh from Excel</a> <a href="{history_url}">History Overview</a> <a href="{comment_url}">Add Comment</a> <a href="{delete_ticket_url}">Delete Ticket</a> <a href="{register_url}">Edit Register</a> <a href="{repo_url}">Asset Vehicles</a> <a href="{log_url}">Activity Log</a></nav>
 <div class="container">
 <h1>{title}</h1>
 {log_strip}
@@ -164,7 +166,11 @@ def render_page(title: str, body: str) -> str:
 @app.route("/")
 def index() -> str:
     """Show the form to log an activity and select which vehicles it applies to."""
-    vehicles = load_vehicles(VEHICLES_DIR)
+    client = JiraClient(load_config())
+    try:
+        vehicles = load_asset_vehicles(client)
+    finally:
+        client.close()
     checkboxes = "\n".join(
         f'<label><input type="checkbox" name="vehicles" value="{esc(v.label)}"> {esc(v.label)}</label>'
         for v in vehicles
@@ -219,7 +225,11 @@ def create() -> str:
     if not activity:
         return render_page("Error", f'<p class="msg">Activity is required.</p><p><a href="{url_for("index")}">Back</a></p>')
 
-    all_vehicles = {v.label: v for v in load_vehicles(VEHICLES_DIR)}
+    asset_client = JiraClient(load_config())
+    try:
+        all_vehicles = {v.label: v for v in load_asset_vehicles(asset_client)}
+    finally:
+        asset_client.close()
     rows = []
 
     if not confirm:
@@ -274,14 +284,12 @@ def create() -> str:
                 extra_fields=extra_fields,
             )
             key = result["key"]
-            # Re-read from disk right before writing so a prior save in this same
-            # batch (or from another request) is never clobbered by a stale copy.
-            vehicle = load_vehicle(vehicle.source_path)
+            vehicle = load_asset_vehicles(client, {label})[0]
             vehicle.history.append(HistoryEntry(
                 date=entry_date, activity=activity, description=description, ticket=key,
                 due_date=due_date, priority=priority, assignee=assignee,
             ))
-            save_vehicle_history(vehicle)
+            save_asset_history(client, vehicle, history_attribute_id(client, create=True))
             ticket_url = f"{config.effective_web_base_url}/jira/browse/{key}"
             rows.append(
                 f'<tr><td>{esc(label)}</td><td>{esc(summary)}</td>'
@@ -308,7 +316,12 @@ def sprint_form() -> str:
     creates one Jira issue + checklist per remaining test. Same dry-run-by-default
     convention as every other write path in this app.
     """
-    vehicles = load_vehicles(VEHICLES_DIR)
+    config = load_config()
+    asset_client = JiraClient(config)
+    try:
+        vehicles = load_asset_vehicles(asset_client)
+    finally:
+        asset_client.close()
 
     if request.method == "GET":
         checkboxes = "\n".join(
@@ -414,13 +427,12 @@ def sprint_form() -> str:
         """
         return render_page("Preview Sprint Tickets", body)
 
-    config = load_config()
     client = JiraClient(config)
     log_event(f"Generating {len(built)} sprint ticket(s)...")
     try:
         created: list[tuple[str, str]] = []
         created_labels: dict[str, str] = {}
-        touched_vehicles: dict[str, object] = {}
+        tickets_id = ticket_attribute_id(client, create=True)
         rows = []
         for vehicle, test, _template, summary, description, checklist, label in built:
             extra_fields = vehicle_link_fields(vehicle)
@@ -434,18 +446,13 @@ def sprint_form() -> str:
             created.append((key, checklist))
             created_labels[key] = label
             test.ticket = key
-            touched_vehicles[vehicle.label] = vehicle
+            save_asset_tickets(client, vehicle, tickets_id)
             ticket_url = f"{config.effective_web_base_url}/jira/browse/{key}"
             rows.append(
                 f'<tr><td>{esc(vehicle.label)}</td><td>{esc(test.name)}</td><td>{esc(test.period)}</td>'
                 f'<td><a href="{esc(ticket_url)}" target="_blank">{esc(key)}</a></td></tr>'
             )
             log_event(f"Created {key} ({test.name} / {vehicle.label}).")
-
-        # Persist ticket keys BEFORE the checklist step, which can throw (e.g. expired
-        # browser session) — otherwise real tickets get created but never recorded locally.
-        for vehicle in touched_vehicles.values():
-            save_vehicle_tests(vehicle)
 
         sprint_note = ""
         if not no_sprint_assignment:
@@ -618,8 +625,7 @@ def delete_sprint_action() -> str:
 
 @app.route("/refresh", methods=["GET", "POST"])
 def refresh_form() -> str:
-    """Re-import DLCM_FZG_Planung.xlsx's Jahreskalender sheet into vehicles/*.yaml,
-    and optionally push the refreshed tests onto each vehicle's Insight FZG object.
+    """Refresh FZG Assets test queues from the Excel Jahreskalender sheet.
 
     Web-UI equivalent of running import_jahreskalender.py then sync_tests_to_insight.py.
     Optionally accepts a replacement .xlsx upload (kept as a new copy, does not
@@ -632,14 +638,12 @@ def refresh_form() -> str:
           <label>Replace Excel file (optional — leave empty to reuse {esc(DEFAULT_XLSX.name)})
             <input type="file" name="xlsx_file" accept=".xlsx">
           </label>
-          <label><input type="checkbox" name="sync_insight" value="1" checked> Also push refreshed tests onto Insight FZG objects</label>
           <label><input type="checkbox" name="confirm" value="1"> Actually write changes now (uncheck to preview only)</label>
           <button type="submit">Submit</button>
         </form>
         """
         return render_page("Refresh from Excel", body)
 
-    sync_insight = request.form.get("sync_insight") == "1"
     confirm = request.form.get("confirm") == "1"
 
     # An uploaded file can't be re-attached to the "Confirm & Apply" resubmit form
@@ -666,7 +670,13 @@ def refresh_form() -> str:
 
     if confirm:
         log_event(f"Refreshing vehicle tests from {xlsx_path.name}...")
-    calendar_result = import_calendar(xlsx_path, VEHICLES_DIR, confirm=confirm)
+    config = load_config()
+    client = JiraClient(config)
+    try:
+        asset_vehicles = load_asset_vehicles(client)
+    finally:
+        client.close()
+    calendar_result = import_calendar(xlsx_path, asset_vehicles)
     if confirm:
         log_event(f"Calendar refresh applied to {len(calendar_result['matched'])} vehicle(s).")
 
@@ -675,8 +685,9 @@ def refresh_form() -> str:
         for label, existing, new in calendar_result["matched"]
     )
     unmatched_html = (
-        f'<p>Unmatched calendar names (no corresponding vehicles/*.yaml): {esc(", ".join(calendar_result["unmatched"]))}</p>'
-        if calendar_result["unmatched"] else ""
+        f'<p>New FZG Assets {"created" if confirm else "planned"}: '
+        f'{esc(", ".join(v.label for v in calendar_result["new_vehicles"]))}</p>'
+        if calendar_result["new_vehicles"] else ""
     )
 
     if calendar_result["diffs"]:
@@ -698,7 +709,7 @@ def refresh_form() -> str:
     )
 
     insight_html = ""
-    if sync_insight and calendar_result["vehicles"]:
+    if calendar_result["vehicles"]:
         config = load_config()
         client = JiraClient(config)
         if confirm:
@@ -732,7 +743,6 @@ def refresh_form() -> str:
     {inactive_html}
     {insight_html}
     <form method="post" action="{url_for('refresh_form')}" enctype="multipart/form-data">
-      <input type="hidden" name="sync_insight" value="{'1' if sync_insight else '0'}">
       <input type="hidden" name="xlsx_tmp_path" value="{esc(str(xlsx_path)) if xlsx_path != DEFAULT_XLSX else ''}">
       <input type="hidden" name="confirm" value="1">
       <button type="submit">Confirm &amp; Apply</button>
@@ -745,7 +755,11 @@ def refresh_form() -> str:
 @app.route("/history")
 def history_view() -> str:
     """Show every vehicle's history log, with links to any linked Jira tickets."""
-    vehicles = load_vehicles(VEHICLES_DIR)
+    client = JiraClient(load_config())
+    try:
+        vehicles = load_asset_vehicles(client)
+    finally:
+        client.close()
     try:
         base_url = load_config().effective_web_base_url
     except RuntimeError:
@@ -896,11 +910,22 @@ def delete_ticket_form() -> str:
     ))
     log_event(f"Ticket {ticket} deleted.")
 
-    vehicles = load_vehicles(VEHICLES_DIR)
-    touched = clear_ticket_reference(vehicles, ticket)
-    for vehicle in touched:
-        save_vehicle_tests(vehicle)
-        save_vehicle_history(vehicle)
+    client = JiraClient(config)
+    try:
+        vehicles = load_asset_vehicles(client)
+        touched = clear_ticket_reference(vehicles, ticket)
+        if touched:
+            tickets_id = ticket_attribute_id(client)
+            if tickets_id is None:
+                raise RuntimeError("FZG Tickets attribute is missing")
+            history_id = history_attribute_id(client)
+            for vehicle in touched:
+                if vehicle.tests:
+                    save_asset_tickets(client, vehicle, tickets_id)
+                if history_id is not None:
+                    save_asset_history(client, vehicle, history_id)
+    finally:
+        client.close()
     vehicle_note = (
         f'<p class="msg">Cleared the ticket reference from: {esc(", ".join(v.label for v in touched))}.</p>'
         if touched else ""
@@ -963,106 +988,25 @@ def log_view() -> str:
 
 @app.route("/repo")
 def repo_list() -> str:
-    """List the vehicle YAML files attached to the test-repo reference ticket."""
-    config = load_config()
-    client = JiraClient(config)
+    """List live FZG Assets vehicles and their test counts."""
+    client = JiraClient(load_config())
     try:
-        attachments = client.get_attachments(REPO_TICKET)
+        vehicles = load_asset_vehicles(client)
     finally:
         client.close()
-    yaml_attachments = [a for a in attachments if a["filename"].endswith(".yaml")]
-
-    ticket_url = f"{config.effective_web_base_url}/jira/browse/{REPO_TICKET}"
-    rows = []
-    for att in sorted(yaml_attachments, key=lambda a: a["filename"]):
-        edit_url = url_for("repo_edit", filename=att["filename"])
-        local_marker = "" if (VEHICLES_DIR / att["filename"]).is_file() else ' <span class="badge" style="background:#7f8c8d">no local copy</span>'
-        rows.append(
-            f"<tr><td><a href=\"{esc(edit_url)}\">{esc(att['filename'])}</a>{local_marker}</td>"
-            f"<td>{att['size']} bytes</td><td>{esc(att['created'])}</td></tr>"
-        )
-    body = (
-        f'<p>Reference ticket: <a href="{esc(ticket_url)}" target="_blank">{esc(REPO_TICKET)}</a></p>'
-        f"<table><tr><th>File</th><th>Size</th><th>Created</th></tr>{''.join(rows)}</table>"
-        if rows else f'<p>No .yaml attachments found on <a href="{esc(ticket_url)}" target="_blank">{esc(REPO_TICKET)}</a>.</p>'
+    rows = "".join(
+        f"<tr><td>{esc(v.label)}</td><td>{esc(v.key)}</td><td>{esc(v.vin)}</td>"
+        f"<td>{len(v.tests)}</td><td>{sum(bool(t.ticket) for t in v.tests)}</td></tr>"
+        for v in vehicles
     )
-    return render_page("Test Repo Files", body)
+    return render_page("Asset Vehicles", "<table><tr><th>Vehicle</th><th>Asset key</th>"
+                       "<th>VIN</th><th>Tests</th><th>Tickets</th></tr>" + rows + "</table>")
 
 
 @app.route("/repo/<filename>", methods=["GET", "POST"])
 def repo_edit(filename: str) -> str:
-    """Read (and optionally save) one vehicle YAML file attached to the test-repo reference ticket."""
-    if "/" in filename or "\\" in filename or not filename.endswith(".yaml"):
-        return render_page("Error", f'<p class="msg">Invalid filename.</p><p><a href="{url_for("repo_list")}">Back</a></p>')
-
-    config = load_config()
-    client = JiraClient(config)
-    try:
-        if request.method == "GET":
-            attachments = client.get_attachments(REPO_TICKET)
-            match = next((a for a in attachments if a["filename"] == filename), None)
-            if match is None:
-                return render_page("Error", f'<p class="msg">{esc(filename)} is not attached to {esc(REPO_TICKET)}.</p><p><a href="{url_for("repo_list")}">Back</a></p>')
-            content = client.download_attachment(match["content_url"]).decode("utf-8")
-        else:
-            content = request.form.get("content", "")
-            confirm = request.form.get("confirm") == "1"
-
-            try:
-                parsed = yaml.safe_load(content)
-            except yaml.YAMLError as exc:
-                return render_page("Error", f'<p class="msg">Invalid YAML: {esc(str(exc))}</p><p><a href="{url_for("repo_edit", filename=filename)}">Back</a></p>')
-            if not parsed or "label" not in parsed:
-                return render_page("Error", f'<p class="msg">YAML must have a top-level \"label:\" key (vehicle files only).</p><p><a href="{url_for("repo_edit", filename=filename)}">Back</a></p>')
-
-            if not confirm:
-                body = f"""
-                <p class="msg">Preview only \u2014 nothing was saved yet.</p>
-                <form method="post" action="{url_for('repo_edit', filename=filename)}">
-                  <textarea name="content" rows="20">{esc(content)}</textarea>
-                  <input type="hidden" name="confirm" value="1">
-                  <button type="submit">Confirm &amp; Save (local + Jira attachment)</button>
-                </form>
-                <p><a href="{url_for('repo_list')}">Back</a></p>
-                """
-                return render_page(f"Preview: {filename}", body)
-
-            local_path = VEHICLES_DIR / filename
-            local_path.write_text(content, encoding="utf-8")
-
-            attachments = client.get_attachments(REPO_TICKET)
-            existing = next((a for a in attachments if a["filename"] == filename), None)
-            if existing is not None:
-                client.delete_attachment(existing["id"], confirm=True)
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_path = Path(tmp_dir) / filename
-                tmp_path.write_text(content, encoding="utf-8")
-                client.add_attachment(REPO_TICKET, str(tmp_path), confirm=True)
-
-            append_entry(RegisterEntry(
-                timestamp=datetime.now().isoformat(timespec="seconds"),
-                ticket=REPO_TICKET,
-                action="edit_vehicle_yaml",
-                details=filename,
-            ))
-            body = f"""
-            <p class="msg">Saved {esc(filename)} \u2014 updated locally in vehicles/ and re-uploaded to {esc(REPO_TICKET)}.</p>
-            <p><a href="{url_for('repo_edit', filename=filename)}">Edit again</a> &middot; <a href="{url_for('repo_list')}">Back to file list</a></p>
-            """
-            return render_page("Saved", body)
-    finally:
-        client.close()
-
-    body = f"""
-    <form method="post" action="{url_for('repo_edit', filename=filename)}">
-      <textarea name="content" rows="20">{esc(content)}</textarea>
-      <input type="hidden" name="confirm" value="0">
-      <button type="submit">Preview Changes</button>
-    </form>
-    <p><a href="{url_for('repo_list')}">Back</a></p>
-    """
-    return render_page(f"Edit: {filename}", body)
-
+    """Direct old vehicle-file links to the live Assets list."""
+    return render_page("Asset Vehicles", f'<p>Vehicle files are managed in Assets. <a href="{url_for("repo_list")}">View Assets</a>.</p>')
 
 if __name__ == "__main__":
     app.run(debug=True)

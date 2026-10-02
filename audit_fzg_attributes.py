@@ -18,7 +18,7 @@ from jira_agent.jira_client import JiraClient
 
 STANDARD_ATTRIBUTES = [
     "Key", "Bezeichnung", "Created", "Updated", "VIN", "Scope", "Markt",
-    "Aktivität", "Baureihe", "ZielStand", "Testart", "Tests", "Testplanung (KW)",
+    "Aktivität", "Baureihe", "ZielStand", "Testart", "Tests", "Testplanung (KW)", "Tickets",
 ]
 
 

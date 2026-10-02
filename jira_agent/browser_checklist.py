@@ -18,8 +18,9 @@ exactly like a secret. It must never be committed (see .gitignore's ``.auth/``).
 from __future__ import annotations
 
 from pathlib import Path
+from app_paths import APP_DIR
 
-DEFAULT_STATE_PATH = Path(__file__).parent.parent / ".auth" / "jira_browser_state.json"
+DEFAULT_STATE_PATH = APP_DIR / ".auth" / "jira_browser_state.json"
 
 
 def save_login_state(base_url: str, state_path: Path = DEFAULT_STATE_PATH, timeout_ms: int = 300_000) -> None:

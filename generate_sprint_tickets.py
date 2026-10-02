@@ -1,9 +1,6 @@
 """Generate one sprint-checklist ticket per test vehicle, from a template.
 
-Test vehicles come from local YAML files under vehicles/*.yaml by default (see
-jira_agent/vehicle.py) — this repo is the source of truth rather than the
-read-only-for-us Jira Insight/Assets plugin. Pass --from-assets to instead query
-Insight live (JiraClient.list_test_vehicles). Checklists are written via the
+Test vehicles come from FZG Assets objects. Checklists are written via the
 browser-automation workaround (see jira_agent/browser_checklist.py) since the
 Smart Checklist field can't be set through the normal issue API on this instance.
 
@@ -12,8 +9,7 @@ One-time setup (if not already done):
 
 Usage:
     python generate_sprint_tickets.py --sprint "KW37" [--template analysis_checklist]
-        [--vehicles "PT1023,PT1123"] [--vehicles-dir vehicles] [--from-assets]
-        [--vehicle-iql "objectType = Autos"] [--limit N] [--confirm] [--headed]
+        [--vehicles "PT1023,PT1123"] [--limit N] [--confirm] [--headed]
 
 Dry-run by default: prints the full plan (tickets to create + checklist preview)
 without touching Jira. Pass --confirm to actually create tickets and write checklists.
@@ -23,28 +19,26 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from dotenv import load_dotenv
 
 from jira_agent.browser_checklist import write_checklists_via_browser
 from jira_agent.checklist import load_template
 from jira_agent.config import load_config
 from jira_agent.jira_client import JiraClient
-from jira_agent.vehicle import load_vehicles
+from jira_agent.asset_vehicles import load_asset_vehicles
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
-VEHICLES_DIR = Path(__file__).parent / "vehicles"
 
 
 def main() -> None:
     """Parse CLI args, build the ticket plan, and preview/execute it."""
+    load_dotenv(Path(__file__).parent / ".env")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sprint", required=True, help='Free-text sprint identifier, e.g. "KW37"')
     parser.add_argument("--template", default="analysis_checklist", help="Template file stem under templates/")
     parser.add_argument("--project", default="PHUB", help="Jira project key (default: PHUB)")
     parser.add_argument("--issue-type", default="Task", help="Jira issue type name (default: Task)")
     parser.add_argument("--vehicles", help="Comma-separated vehicle labels to include (default: all found)")
-    parser.add_argument("--vehicles-dir", default=str(VEHICLES_DIR), help="Directory of local vehicle YAML files (default: vehicles/)")
-    parser.add_argument("--from-assets", action="store_true", help="Query the Insight/Assets API live instead of local vehicles/*.yaml")
-    parser.add_argument("--vehicle-iql", default="objectType = Autos", help="Insight IQL filter for vehicles (only with --from-assets)")
     parser.add_argument("--limit", type=int, default=10, help="Safety cap on number of vehicles processed (default 10)")
     parser.add_argument("--confirm", action="store_true", help="Actually create tickets + write checklists (default: dry-run only)")
     parser.add_argument("--headed", action="store_true", help="Show the browser window instead of headless")
@@ -58,10 +52,7 @@ def main() -> None:
     config = load_config()
     client = JiraClient(config)
     try:
-        if args.from_assets:
-            vehicles = client.list_test_vehicles(iql=args.vehicle_iql, max_results=max(args.limit * 2, 50))
-        else:
-            vehicles = [{"label": v.label, "key": v.key} for v in load_vehicles(args.vehicles_dir)]
+        vehicles = [{"label": v.label, "key": v.key} for v in load_asset_vehicles(client)]
         if args.vehicles:
             wanted = {v.strip() for v in args.vehicles.split(",") if v.strip()}
             vehicles = [v for v in vehicles if v["label"] in wanted]

@@ -11,7 +11,19 @@ into the shell manually before running this.
 
 from __future__ import annotations
 
+import os
+import sys
+import threading
+import webbrowser
+
+from app_paths import APP_DIR
+
+if getattr(sys, "frozen", False):
+    os.chdir(APP_DIR)
+
 from webapp import app
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    if getattr(sys, "frozen", False):
+        threading.Timer(1.5, webbrowser.open, args=("http://127.0.0.1:5000/",)).start()
+    app.run(host="127.0.0.1", port=5000, debug=not getattr(sys, "frozen", False), use_reloader=False)

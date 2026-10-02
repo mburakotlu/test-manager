@@ -63,6 +63,8 @@ class Vehicle:
     market: str = ""
     scope: str = ""
     tec_pc: str = ""
+    cluster: str = ""
+    zielstand: str = ""
     tests: list[TestAssignment] = field(default_factory=list)
     history: list[HistoryEntry] = field(default_factory=list)
     source_path: Path | None = None  # not persisted; set by load_vehicle/load_vehicles

@@ -27,6 +27,17 @@ python -m playwright install chromium   # only needed for checklist/browser auto
 copy .env.example .env   # then edit .env with your own values — never commit it
 ```
 
+### Windows executable
+
+On a Windows build machine, install `requirements.txt` into `.venv` as above,
+then install PyInstaller (`python -m pip install pyinstaller`) and run
+`python build_exe.py`. The distributable folder is `dist/JiraManager/`.
+Keep that whole folder together. Copy its `.env.example` to `.env`, add your own
+credentials, and double-click `JiraManager.exe`. The local web app opens at
+`http://127.0.0.1:5000/`. Close the console to stop it. The EXE does not require
+Python on the destination machine. Browser checklist features need a separately
+installed Playwright Chromium browser.
+
 Required env vars (see `.env.example`):
 
 | Var | Required | Notes |
@@ -49,8 +60,21 @@ python test_connection.py PHUB-1
 
 ## Generate sprint checklist tickets for test vehicles
 
-Test vehicles come from the Jira Insight/Assets plugin (schema `PEDSFLEET`, object
-type `Autos`). Checklists come from `templates/*.yaml` and are written via the
+The FZG Assets objects (schema 607, object type 4321) hold three aligned,
+pipe-separated fields: `Tests`, `Testplanung (KW)`, and `Tickets`. Each test has
+one ticket slot; `x` means no ticket has been assigned. The sprint web page and
+`generate_from_vehicles.py` read these fields from Assets and write newly created
+ticket keys back to `Tickets`. They do not use vehicle YAML for the test queue.
+
+Vehicle details, test queues, ticket links, and activity history are stored in
+FZG Assets. The web calendar refresh and `import_jahreskalender.py --confirm`
+read the Excel planning list and update Assets directly. Existing ticketed tests
+stay linked if absent from the new calendar, and new calendar vehicles get FZG
+Assets objects. `templates/*.yaml` are still used
+for checklist templates; they are not vehicle records.
+
+Test vehicles come from the Jira Insight/Assets plugin (schema 607, object
+type `FZG`). Checklists come from `templates/*.yaml` and are written via the
 browser-automation workaround (see Known limitation below).
 
 One-time setup:

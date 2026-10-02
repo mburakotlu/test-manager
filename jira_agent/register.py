@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from app_paths import APP_DIR
 
-REGISTER_PATH = Path(__file__).parent.parent / "register.yaml"
+REGISTER_PATH = APP_DIR / "register.yaml"
 
 
 @dataclass

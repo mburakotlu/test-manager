@@ -1,13 +1,10 @@
 """Show an overview of which sprints (periods) include which vehicles/tests.
 
-Reads vehicles/*.yaml (see jira_agent/vehicle.py) and prints a grouped view,
-including the linked Jira ticket key/URL for any test that's already been
-generated (see generate_from_vehicles.py, which persists ticket keys back onto
-each test entry after creation).
+Reads FZG Assets and prints a grouped view, including linked Jira ticket keys.
 
 Usage:
     python vehicle_overview.py [--group-by period|vehicle] [--period "KW37"]
-        [--vehicles "SE0400,SE0607"] [--vehicles-dir vehicles]
+        [--vehicles "SE0400,SE0607"]
 """
 
 from __future__ import annotations
@@ -15,27 +12,30 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from pathlib import Path
+from dotenv import load_dotenv
 
 from jira_agent.config import load_config
-from jira_agent.vehicle import load_vehicles
+from jira_agent.jira_client import JiraClient
+from jira_agent.asset_vehicles import load_asset_vehicles
 
-VEHICLES_DIR = Path(__file__).parent / "vehicles"
 
 
 def main() -> None:
     """Parse CLI args and print the requested overview grouping."""
+    load_dotenv(Path(__file__).parent / ".env")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--group-by", choices=["period", "vehicle"], default="period",
                         help="Group the overview by sprint/period (default) or by vehicle")
     parser.add_argument("--period", help='Only show this period, e.g. "KW37" (default: all)')
     parser.add_argument("--vehicles", help="Comma-separated vehicle labels to include (default: all)")
-    parser.add_argument("--vehicles-dir", default=str(VEHICLES_DIR), help="Directory of local vehicle YAML files (default: vehicles/)")
     args = parser.parse_args()
 
-    vehicles = load_vehicles(args.vehicles_dir)
-    if args.vehicles:
-        wanted = {v.strip() for v in args.vehicles.split(",") if v.strip()}
-        vehicles = [v for v in vehicles if v.label in wanted]
+    client = JiraClient(load_config())
+    try:
+        wanted = {v.strip() for v in args.vehicles.split(",") if v.strip()} if args.vehicles else None
+        vehicles = load_asset_vehicles(client, wanted)
+    finally:
+        client.close()
 
     try:
         base_url = load_config().effective_web_base_url

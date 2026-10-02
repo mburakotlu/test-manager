@@ -835,6 +835,32 @@ class JiraClient:
             "name": data.get("name"),
         }
 
+    def get_object_type_attributes(self, object_type_id: int) -> list[dict[str, Any]]:
+        """Return the attribute definitions for an Insight object type."""
+        response = self._http.get(
+            f"/jira/rest/insight/1.0/objecttype/{object_type_id}/attributes"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def create_insight_object(self, object_type_id: int,
+                              attribute_values: dict[int, list[str]],
+                              confirm: bool = False) -> dict[str, Any]:
+        """Create an Assets object with explicit object type attribute values."""
+        payload = {
+            "objectTypeId": object_type_id,
+            "attributes": [
+                {"objectTypeAttributeId": attr_id,
+                 "objectAttributeValues": [{"value": value} for value in values]}
+                for attr_id, values in attribute_values.items()
+            ],
+        }
+        if not confirm:
+            return {"created": False, "preview": payload}
+        response = self._http.post("/jira/rest/insight/1.0/object/create", json=payload)
+        response.raise_for_status()
+        return response.json()
+
     def update_insight_object_attributes(
         self,
         object_id: int,
