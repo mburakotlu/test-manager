@@ -44,7 +44,7 @@ def main() -> None:
         check=True,
     )
 
-    for directory in ("vehicles", "templates"):
+    for directory in ("templates",):
         shutil.copytree(ROOT / directory, OUTPUT / directory)
     for filename in ("DLCM_FZG_Planung.xlsx", "register.yaml", ".env.example"):
         shutil.copy2(ROOT / filename, OUTPUT / filename)
