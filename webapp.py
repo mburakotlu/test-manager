@@ -23,7 +23,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, request, url_for
-from app_paths import APP_DIR
+from app_paths import APP_DIR, APP_VERSION
 
 # Loaded here (not just in main.py) so `python webapp.py` also works without
 # manually exporting env vars into the shell first.
@@ -118,7 +118,7 @@ function setVehicleChecks(button, checked) {{
 </script>
 </head>
 <body>
-<nav><a href="{index_url}">Create Activity</a> <a href="{sprint_url}">Generate Sprint Tickets</a> <a href="{refresh_url}">Refresh from Excel</a> <a href="{history_url}">History Overview</a> <a href="{comment_url}">Add Comment</a> <a href="{delete_ticket_url}">Delete Ticket</a> <a href="{register_url}">Edit Register</a> <a href="{repo_url}">Asset Vehicles</a> <a href="{log_url}">Activity Log</a></nav>
+<nav><a href="{index_url}">Create Activity</a> <a href="{sprint_url}">Generate Sprint Tickets</a> <a href="{refresh_url}">Refresh from Excel</a> <a href="{history_url}">History Overview</a> <a href="{comment_url}">Add Comment</a> <a href="{delete_ticket_url}">Delete Ticket</a> <a href="{register_url}">Edit Register</a> <a href="{repo_url}">Asset Vehicles</a> <a href="{log_url}">Activity Log</a> <span style="float:right;color:#ecf0f1;">v{app_version}</span></nav>
 <div class="container">
 <h1>{title}</h1>
 {log_strip}
@@ -151,6 +151,7 @@ def render_page(title: str, body: str) -> str:
         title=esc(title),
         body=body,
         log_strip=log_strip,
+        app_version=esc(APP_VERSION),
         index_url=url_for("index"),
         sprint_url=url_for("sprint_form"),
         refresh_url=url_for("refresh_form"),

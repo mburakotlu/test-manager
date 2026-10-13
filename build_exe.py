@@ -12,10 +12,40 @@ import subprocess
 import sys
 from pathlib import Path
 
+from app_paths import APP_VERSION
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "dist" / "JiraManager"
 VENV_PACKAGES = ROOT / ".venv" / "Lib" / "site-packages"
+VERSION_FILE = ROOT / "build" / "version_info.txt"
+
+
+def _version_tuple() -> tuple[int, int, int, int]:
+    parts = [int(p) for p in APP_VERSION.split(".")]
+    parts += [0] * (4 - len(parts))
+    return tuple(parts[:4])  # type: ignore[return-value]
+
+
+def _write_version_file() -> None:
+    """Write a PyInstaller version-info file so JiraManager.exe's Windows
+    file properties (Details tab) show APP_VERSION."""
+    v = _version_tuple()
+    VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    VERSION_FILE.write_text(
+        f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={v}, prodvers={v}),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('FileVersion', '{APP_VERSION}'),
+      StringStruct('ProductVersion', '{APP_VERSION}'),
+      StringStruct('ProductName', 'Jira Manager'),
+      StringStruct('FileDescription', 'Jira Manager'),
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])]),
+  ]
+)""",
+        encoding="utf-8",
+    )
 
 
 def main() -> None:
@@ -26,6 +56,7 @@ def main() -> None:
     if OUTPUT.exists():
         raise SystemExit(f"Move or remove the existing output first: {OUTPUT}")
 
+    _write_version_file()
     subprocess.run(
         [
             sys.executable,
@@ -38,6 +69,7 @@ def main() -> None:
             "--paths", str(VENV_PACKAGES),
             "--collect-all", "playwright",
             "--hidden-import", "playwright.sync_api",
+            "--version-file", str(VERSION_FILE),
             str(ROOT / "main.py"),
         ],
         cwd=ROOT,
@@ -49,7 +81,7 @@ def main() -> None:
     for filename in ("DLCM_FZG_Planung.xlsx", "register.yaml", ".env.example"):
         shutil.copy2(ROOT / filename, OUTPUT / filename)
     (OUTPUT / "START_HERE.txt").write_text(
-        "Jira Manager\n\n"
+        f"Jira Manager v{APP_VERSION}\n\n"
         "1. Copy .env.example to .env in this folder.\n"
         "2. Edit .env with your Jira URL, email and personal access token.\n"
         "3. Double-click JiraManager.exe. The local web app opens in your browser.\n\n"
