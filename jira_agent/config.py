@@ -36,6 +36,14 @@ VEHICLE_DESCRIPTION_FIELD_ID = "customfield_18800"  # "Vehicle description"
 PRODUCT_CATEGORY_FIELD_ID = "customfield_11801"
 PRODUCT_CATEGORY_VALUE = {"value": "AP1_Automatisierung", "child": {"value": "R4 Automatisierung"}}
 
+# Board 114663's saved filter ("DLCM Testing&Automation Board", id 155274) also
+# restricts visible issues to a reporter whitelist (VKB0A6G, VN5ZNR6, D286UXS,
+# FNS8FMO) — tickets reported by any other account are silently excluded from the
+# board/sprint view even though their Sprint field is set correctly. Verified
+# 2026-11-04 against PHUB-2548. Default new tickets to reporter/assignee
+# "VN5ZNR6" (Taleb, Youssef) so they always show up on the board.
+DEFAULT_REPORTER_USERNAME = "VN5ZNR6"
+
 
 @dataclass(frozen=True)
 class JiraConfig:

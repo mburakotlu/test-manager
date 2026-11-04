@@ -557,10 +557,16 @@ class JiraClient:
         if not summary or not summary.strip():
             raise ValueError("Summary must be non-empty.")
 
+        from jira_agent.config import DEFAULT_REPORTER_USERNAME
+
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "issuetype": {"name": issue_type},
             "summary": summary.strip(),
+            # Default reporter/assignee — board 114663's saved filter only shows
+            # tickets reported by a whitelisted account (see config.py notes).
+            "reporter": {"name": DEFAULT_REPORTER_USERNAME},
+            "assignee": {"name": DEFAULT_REPORTER_USERNAME},
         }
         if description:
             fields["description"] = description

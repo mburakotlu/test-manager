@@ -29,7 +29,7 @@ from app_paths import APP_DIR, APP_VERSION
 # manually exporting env vars into the shell first.
 load_dotenv(APP_DIR / ".env")
 
-from jira_agent.browser_checklist import write_checklists_via_browser
+from jira_agent.browser_checklist import save_pending_checklists, write_checklists_via_browser
 from jira_agent.checklist import render_test_checklist
 from jira_agent.config import load_config
 from jira_agent.jira_client import JiraClient
@@ -472,7 +472,24 @@ def sprint_form() -> str:
             sprint_note = "<p class=\"msg\">" + "<br>".join(sprint_lines) + f" on board {board_id}.</p>"
 
         log_event(f"Writing checklists via browser automation for {len(created)} ticket(s) — this runs in the background and can take a while...")
-        write_checklists_via_browser(config.effective_web_base_url, created)
+        try:
+            write_checklists_via_browser(config.effective_web_base_url, created)
+        except Exception as exc:
+            # Tickets (and sprint assignment) above already succeeded — don't lose
+            # track of their checklists just because the browser session expired.
+            save_pending_checklists(created)
+            log_event(f"Checklist write failed, saved {len(created)} ticket(s) as pending: {exc}")
+            body = f"""
+            <p class="msg">Created {len(created)} ticket(s) (and sprint, if requested), but writing
+            their checklist(s) failed: {esc(str(exc))}</p>
+            <p>The pending checklist(s) were saved to <code>pending_checklists.json</code>. After
+            fixing the browser session (e.g. <code>python browser_login.py</code>), run
+            <code>python retry_pending_checklists.py</code> to write them.</p>
+            {sprint_note}
+            <table><tr><th>Vehicle</th><th>Test</th><th>Period</th><th>Ticket</th></tr>{''.join(rows)}</table>
+            <p><a href="{url_for('sprint_form')}">Back</a></p>
+            """
+            return render_page("Tickets Created — Checklist Pending", body)
         log_event(f"Checklist write finished for {len(created)} ticket(s).")
     finally:
         client.close()

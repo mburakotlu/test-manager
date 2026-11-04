@@ -17,10 +17,34 @@ exactly like a secret. It must never be committed (see .gitignore's ``.auth/``).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from app_paths import APP_DIR
 
 DEFAULT_STATE_PATH = APP_DIR / ".auth" / "jira_browser_state.json"
+# Tickets whose checklist write failed (e.g. expired session) get stashed here so
+# the already-created Jira issues aren't orphaned without their checklist — see
+# save_pending_checklists/load_pending_checklists and retry_pending_checklists.py.
+PENDING_CHECKLISTS_PATH = APP_DIR / "pending_checklists.json"
+
+
+def save_pending_checklists(items: list[tuple[str, str]], path: Path = PENDING_CHECKLISTS_PATH) -> None:
+    """Append ``(issue_key, checklist_text)`` pairs to the pending-checklists file."""
+    existing = load_pending_checklists(path)
+    existing.extend(items)
+    path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
+
+def load_pending_checklists(path: Path = PENDING_CHECKLISTS_PATH) -> list[tuple[str, str]]:
+    """Return the saved ``(issue_key, checklist_text)`` pairs, or ``[]`` if none are pending."""
+    if not path.is_file():
+        return []
+    return [tuple(pair) for pair in json.loads(path.read_text(encoding="utf-8"))]
+
+
+def clear_pending_checklists(path: Path = PENDING_CHECKLISTS_PATH) -> None:
+    """Delete the pending-checklists file once all of its items have been written."""
+    path.unlink(missing_ok=True)
 
 
 def save_login_state(base_url: str, state_path: Path = DEFAULT_STATE_PATH, timeout_ms: int = 300_000) -> None:

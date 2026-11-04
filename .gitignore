@@ -9,6 +9,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .auth/
+pending_checklists.json
 .vscode/mcp.json
 build/
 dist/
