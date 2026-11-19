@@ -83,9 +83,13 @@ def main() -> None:
     (OUTPUT / "START_HERE.txt").write_text(
         f"Jira Manager v{APP_VERSION}\n\n"
         "1. Copy .env.example to .env in this folder.\n"
-        "2. Edit .env with your Jira URL, email and personal access token.\n"
-        "3. Double-click JiraManager.exe. The local web app opens in your browser.\n\n"
+        "2. Run JiraManager.exe --generate-secret and put the output in APP_SECRET_KEY in .env.\n"
+        "3. Add the automation Jira credentials to .env; keep the token private.\n"
+        "4. Run JiraManager.exe --import-workbook to preview, then add --confirm for a one-time import.\n"
+        "5. Run JiraManager.exe --bootstrap-admin to create the first app administrator.\n"
+        "6. Double-click JiraManager.exe. The local web app opens in your browser.\n\n"
         "Keep the whole JiraManager folder together. Do not share .env or .auth.\n"
+        "For team use, deploy behind approved HTTPS on a persistent host; do not expose the built-in server.\n"
         "For browser checklist features, install Chromium once with:\n"
         "    python -m playwright install chromium\n"
         "Close the console window to stop the app.\n",
