@@ -64,11 +64,35 @@ Reviewers can use **Edit** on pending or approved bookings to correct the
 vehicle, activity, week/dates, notes, or color before Jira creation starts.
 Edits keep the current review status and are recorded in the Access & Change Log.
 
+New bookings and changes to a booking's vehicle or dates are blocked if they
+overlap a non-rejected booking for the same vehicle. Date ranges include both
+endpoints; week-only bookings cover Monday through Friday. Existing imported
+overlaps remain visible, and editing other details does not require resolving
+them. Workbook imports and syncs do not perform this availability check, so
+review imported updates for overlaps.
+
+Only one session can edit a booking at a time; others see the editor's name.
+The editing session is renewed while the form is open and expires after two
+minutes without a heartbeat. Changes made elsewhere are checked before saving,
+so an outdated edit cannot overwrite them. Planner pages check for updates
+every 15 seconds and offer a refresh without automatically replacing unsaved
+form input. Shared Planner names are self-reported.
+
 When `BOOKING_NOTIFY_TO` is configured, the booking form lists those approvers
 and the person booking must tick at least one. Only the ticked approvers are
 emailed the booking details and a link to the review page; addresses outside
 the configured list are rejected. Emails are sent in the background;
 a mail failure never blocks the booking and is shown in the activity log.
+Each email has **Preview and approve with Jira creation** and **Preview and
+reject** links. After signing in, the reviewer chooses a checklist and optional
+Jira Assets vehicle, previews the ticket, and clicks **Approve and create Jira
+ticket** once. Opening the link alone does not change anything. A changed,
+already-reviewed, or expired preview must be reviewed again; a failed Jira
+request is locked against automatic retry until Jira is checked. The reject
+link opens a separate confirmation without creating a ticket. These links do
+not grant access or identify recipients: any signed-in team user who can use
+the existing review queue can review a forwarded link. Approval in the regular
+review queue remains separate from Jira creation.
 Admins can check the settings and send a test email from **Admin → Email
 Notifications**. For a local trial without a mail server, set
 `MAIL_OUTBOX_DIR` and open the saved `.eml` files in Outlook. Links work for
@@ -121,7 +145,13 @@ they can change their own password or generate a reset password for another
 active account from **Manage Users**. Share temporary/reset passwords through
 an approved secure channel. Sign-in is temporarily locked after five failed
 attempts for the same username and source address; a successful sign-in clears
-the failed-attempt counter. Planner and Automation accounts share one Team
+the failed-attempt counter. Admins can open **Rename** beside another account
+to change its username, or use **Active** and **Save access** to disable or
+restore access without deleting the account; the last active admin cannot be
+deactivated or demoted. Renaming invalidates the account's existing sessions
+and does not rewrite recorded booking or audit names. Consequently, older
+bookings under the former username remain in Activity History but do not appear
+under the new username in My Bookings. Planner and Automation accounts share one Team
 Workspace with a home page linking to activity submission/bookings, booking
 review, Jira ticket creation, vehicle management, and activity history. The
 top navigation provides a shortcut back to Home. Admins can open the **Admin**
@@ -129,6 +159,44 @@ card on Home to manage users, review the access/change log, or change their
 password. VINs appear in the
 vehicle selector, vehicle list, and booking lists. Team users do not need Jira
 accounts or tokens.
+Use **Search pages** in the top navigation to find available app sections (not
+individual vehicles or bookings). The Vehicles and booking review pages also
+provide local searches of the currently displayed list; admin users can search
+the displayed users and access log. These searches do not fetch additional
+records. The calendar count covers activities overlapping the displayed dates,
+including days from adjacent months. The **Profile** menu shows the current name
+and provides **Sign out**, **Help**, and a light/dark/system theme selector.
+The Profile menu stays open after hovering so Sign out is easy to click.
+Click outside the menu, click Profile again, or press Escape to close it.
+These controls work by mouse, touch, and keyboard. The theme preference is
+stored in the browser on that device; System follows the device preference.
+The navigation bar and logo adapt to the selected light or dark theme.
+An admin can set or change the name shown under **Profile → Help** through
+**Admin → Help Contact**. Until configured, Help shows "Not configured".
+The **DLCM Planning Hub** home dashboard uses locally hosted Bootstrap 5 grid
+styles. The app-wide theme uses black,
+gray, white, and brown palette uses `#181817`, `#262625`, `#f5f5f4`, and
+`#795b47` respectively.
+
+Dashboard figures are based on planned dates, not live check-in or return
+times. Total vehicles includes inactive vehicles; availability and utilization
+consider active vehicles only. A vehicle is available today if it is not blocked
+and has no non-rejected booking today. Utilization is the percentage of active
+vehicles booked today, including blocked vehicles with an existing booking.
+The dashboard vehicle table shows 10 vehicles per page by default. Choose a
+different page size or **All**, and filter the displayed list by status;
+**Blocked / not available** includes vehicles blocked today. These controls do
+not change the dashboard totals.
+Active Bookings counts all non-rejected bookings spanning today, including
+historical and closed entries; upcoming reservations start after today.
+Week-only activities cover Monday through Friday. The status "In use" means a
+current booking was manually marked In progress; it does not confirm physical
+vehicle use. The admin dashboard shows recent booking audit events. Other team
+members see the five most recently updated bookings and their current statuses,
+including rejected bookings; this is a snapshot rather than an audit history.
+The planner does not currently record booking cancellations.
+Recent background activity and the full background-operation log are visible
+only to admins, not on sign-in pages or in non-admin workspaces.
 
 For shared team access, create one Planner account in **Manage Users** and
 distribute its password securely. Each Planner sign-in asks for the person's
@@ -150,8 +218,9 @@ server directly to a network. Plan regular encrypted backups of the database.
 On a Windows build machine, install `requirements.txt` into `.venv` as above,
 then install PyInstaller (`python -m pip install pyinstaller`) and run
 `python build_exe.py`. The distributable folder is `dist/JiraManager/`.
-Keep that whole folder together. Copy its `.env.example` to `.env`, set the Jira
-credentials and generated app secret, then run `JiraManager.exe
+Keep that whole folder together. Configuration files and the live database are
+not bundled. Obtain approved configuration separately, create `.env` beside the
+EXE, and set the Jira credentials and generated app secret, then run `JiraManager.exe
 --import-workbook` for a preview, `JiraManager.exe --import-workbook --confirm`
 to import once, and `JiraManager.exe --bootstrap-admin` to create the first
 admin. Double-clicking the EXE opens the local app at
@@ -199,10 +268,28 @@ python test_connection.py PHUB-1
    the start of an optional date range that may cross weeks. Dates take
    precedence if both week and dates are entered. Submission creates a pending
    booking in SQLite only; it does not call Jira.
-2. An automation user reviews the booking and approves or rejects it.
+2. An automation user reviews the booking and approves or rejects it. Approving
+   opens the Jira preview immediately; the booking is already approved even if
+   the reviewer leaves the preview.
+   Automation has five filters: **Actionable** (new bookings awaiting review),
+   **Approved**, **Rejected**, **Historical**, and **All**. Jira creation results
+   and errors remain visible under **All**.
 3. For an approved booking, the automation user reviews a ticket and checklist
    preview and explicitly confirms ticket creation. The ticket includes the
    vehicle label and VIN where available. Its Jira key is recorded on the booking.
+   The preview displays booking and ticket details line by line, the exact Jira
+   description, and the checklist. After changing a checklist or Assets selection,
+   select **Preview checklist** again before confirming.
+   The preview can optionally look up an FZG Assets vehicle or accept its exact
+   object key. Check the displayed name and VIN before confirming: the app will
+   attempt to add the ticket to that object's history. If the Assets field is
+   available on the Jira Task creation screen, the ticket also gets a formal
+   Assets link; otherwise the preview warns that no formal link will be made.
+   When no Assets vehicle is selected, neither an Assets link nor a history
+   update is attempted. If the history update fails after ticket creation, the
+   app warns the user to update it manually rather than create another ticket.
+   Existing history is read and rewritten when adding an entry; coordinate
+   concurrent changes to the same Jira Assets history to avoid overwriting them.
 4. The first version does not automatically create or assign Agile sprints.
    The Jira instance has documented sprint persistence issues; group tickets
    manually in Jira until that behavior is verified.
@@ -212,8 +299,37 @@ Verwendungszweck, VIN, and optional existing Jira Assets key) is edited by
 automation users in the app. When adding a vehicle, choose an existing workbook
 section or enter a new section name. Existing vehicle names are allowed; the app
 asks for confirmation before adding a duplicate, and each record keeps its own
-vehicle ID and booking history. A Jira Assets key is a reference only; the app
-database is authoritative for the planner's vehicle data and bookings.
+vehicle ID and booking history. Assets selection is made for each ticket on its
+preview rather than on the vehicle page; the app database is authoritative for
+the planner's vehicle data and bookings.
+On the Vehicles page, use the adjacent **Active vehicles** and **Inactive vehicles**
+tabs. Inside the active panel, **Add new vehicle** at the top right opens a
+small dialog. Inside the inactive panel, **Move to inactive** at the top right
+lets you select an active vehicle to move there. Admins can
+open the three-dot menu at the end of a vehicle row for **Edit**, **Delete**,
+**Add/Edit comment**, and **Block/Unblock**. Saved comments appear as full-width
+notes below their vehicle row only when non-empty, without a Comment column;
+the menu opens a small comment editor. **Delete** opens permanent-deletion review; vehicles with
+booking history cannot be deleted and should be moved to inactive instead.
+Each vehicle also has an admin-only **Blocked** switch in that menu for temporary testing
+unavailability, separate from active/inactive status. Switching it on opens a
+dialog for an optional reason and an inclusive end date; the block starts today.
+Without an end date it lasts until an admin unblocks the vehicle. New bookings
+and date/vehicle changes overlapping the block are rejected atomically.
+Existing bookings are retained, and unrelated booking edits remain allowed.
+Blocked vehicles have their entire row shaded red in the Vehicles section,
+with “Not Available from [start] to [end] — Reason: [reason]” in a full-width
+highlighted note directly below their row, keeping the data columns aligned.
+The note stays on one line when space allows and wraps longer text as needed.
+There is no separate Blocked column. Open-ended blocks say
+“until further notice”; available vehicles show no message. The Excel-style grid
+shows red shading only over blocked dates, without a blocking message or reason.
+Existing activities remain readable, including spans partly overlapping a block.
+Calendar and weekly timeline views do not show blocking notices or shading. The booking form reminds people
+to check the Vehicles section before booking.
+Unblocking clears the current reason/range and removes the red row shading; blocks
+also stop applying after their end date. Block/unblock actions remain recorded
+in the admin audit log, but no blocked-period history is displayed.
 Workbook activities dated before import are retained as read-only history.
 The Testing and Automation views include a year-filtered Excel-style weekly grid,
 a weekly timeline, and a month calendar. The calendar shows each activity on

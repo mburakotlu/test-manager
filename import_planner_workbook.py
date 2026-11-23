@@ -15,6 +15,7 @@ from openpyxl.styles.colors import COLOR_INDEX
 from openpyxl.utils.datetime import from_excel
 
 from dotenv import load_dotenv
+from app_paths import APP_DIR
 from planner_store import (
     import_vehicle_tab_history,
     import_workbook_data,
@@ -25,8 +26,8 @@ from planner_store import (
     update_vehicle_groups,
 )
 
-DEFAULT_WORKBOOK = Path(__file__).parent / "DLCM_FZG_Planung.xlsx"
-load_dotenv(Path(__file__).parent / ".env")
+DEFAULT_WORKBOOK = APP_DIR / "DLCM_FZG_Planung.xlsx"
+load_dotenv(APP_DIR / ".env")
 VEHICLE_COLUMNS = {
     2: "label",
     3: "logger",

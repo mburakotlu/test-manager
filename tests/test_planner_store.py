@@ -2,28 +2,40 @@ from __future__ import annotations
 
 import tempfile
 import sqlite3
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
 from pathlib import Path
 
 from planner_store import (
     add_vehicle,
+    acquire_booking_edit,
     authenticate,
+    BookingChanged,
+    BookingConflict,
     clear_login_failures,
     claim_booking_creation,
+    claim_pending_booking_creation,
     complete_booking_creation,
     connect,
     create_booking,
     create_first_admin,
     create_user,
     get_booking,
+    get_vehicle,
     import_vehicle_tab_history,
     import_workbook_data,
     initialize_database,
     login_is_locked,
     list_vehicles,
+    list_recent_booking_events,
     list_users,
+    planner_revision,
+    release_booking_edit,
     fail_booking_creation,
     record_login_failure,
+    record_audit_event,
     reapprove_failed_booking,
     review_booking,
     sync_workbook_updates,
@@ -31,6 +43,9 @@ from planner_store import (
     update_imported_activity_spans,
     update_user_access,
     update_vehicle_groups,
+    update_booking,
+    set_vehicle_blocked,
+    vehicle_block_bounds,
 )
 
 
@@ -54,6 +69,142 @@ class PlannerStoreTests(unittest.TestCase):
         self.assertIsNotNone(user)
         self.assertEqual(user["role"], "planner")
         self.assertEqual(user["must_change_password"], 0)
+
+    def test_recent_booking_events_filter_and_limit_before_sorting(self) -> None:
+        for number in range(7):
+            record_audit_event("tester", f"Submitted booking #{number}", db_path=self.db_path)
+        record_audit_event("tester", "Signed in", db_path=self.db_path)
+        record_audit_event("reviewer", "Booking rejected", "Booking #3", db_path=self.db_path)
+        record_audit_event("tester", "Edited booking #4", "Changed fields: dates", db_path=self.db_path)
+        events = list_recent_booking_events(self.db_path)
+        self.assertEqual(
+            [event["action"] for event in events],
+            ["Edited booking #4", "Booking rejected", "Submitted booking #6",
+             "Submitted booking #5", "Submitted booking #4"],
+        )
+        self.assertEqual(events[1]["details"], "Booking #3")
+
+    def test_booking_conflicts_cover_ranges_weeks_and_rejected_bookings(self) -> None:
+        vehicle_id = add_vehicle({"label": "CONFLICT-CAR"}, self.db_path)
+        first_id = create_booking(
+            vehicle_id, "First", "KW24-2026", "2026-06-12", "", "", "First user",
+            self.db_path, planned_end_date="2026-06-14",
+        )
+        with self.assertRaisesRegex(BookingConflict, "First user"):
+            create_booking(vehicle_id, "Overlap", "KW24-2026", "", "", "", "Second", self.db_path)
+        saturday_after = create_booking(
+            vehicle_id, "Next", "KW25-2026", "2026-06-15", "", "", "Second", self.db_path
+        )
+        with self.assertRaises(BookingConflict):
+            update_booking(
+                saturday_after, vehicle_id, "Next", "KW24-2026", "2026-06-14", "",
+                self.db_path,
+            )
+        review_booking(first_id, "rejected", "reviewer", self.db_path)
+        create_booking(vehicle_id, "Now available", "KW24-2026", "2026-06-14", "", "", "Second", self.db_path)
+
+    def test_simultaneous_booking_attempts_do_not_both_succeed(self) -> None:
+        vehicle_id = add_vehicle({"label": "RACE-CAR"}, self.db_path)
+        barrier = threading.Barrier(2)
+
+        def reserve(actor: str) -> str:
+            barrier.wait(timeout=10)
+            try:
+                create_booking(vehicle_id, "Race", "KW24-2026", "2026-06-12", "", "", actor, self.db_path)
+            except BookingConflict:
+                return "blocked"
+            return "created"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(reserve, ("one", "two")))
+        self.assertCountEqual(results, ["created", "blocked"])
+
+    def test_temporary_vehicle_block_dates_and_unblocking_preserve_bookings(self) -> None:
+        vehicle_id = add_vehicle({"label": "BLOCK-CAR"}, self.db_path)
+        today = date.today()
+        period = f"KW{today.isocalendar().week:02d}-{today.isocalendar().year}"
+        end = today + timedelta(days=2)
+        existing = create_booking(vehicle_id, "Existing", period, today.isoformat(), "", "", "First", self.db_path)
+        before = planner_revision(self.db_path)
+        set_vehicle_blocked(vehicle_id, True, "Repair", end.isoformat(), self.db_path)
+        self.assertGreater(planner_revision(self.db_path), before)
+        self.assertEqual(vehicle_block_bounds(get_vehicle(vehicle_id, self.db_path)), (today, end))
+        with self.assertRaisesRegex(BookingConflict, "Repair"):
+            create_booking(vehicle_id, "Blocked end", period, end.isoformat(), "", "", "Second", self.db_path)
+        with self.assertRaises(BookingConflict):
+            create_booking(
+                vehicle_id, "Crosses block", period, (today - timedelta(days=1)).isoformat(), "", "", "Second",
+                self.db_path, planned_end_date=today.isoformat(),
+            )
+        after = create_booking(vehicle_id, "After", period, (end + timedelta(days=1)).isoformat(), "", "", "Second", self.db_path)
+        with self.assertRaises(BookingConflict):
+            update_booking(after, vehicle_id, "Moved inside", period, end.isoformat(), "", self.db_path)
+        update_booking(existing, vehicle_id, "Kept existing", period, today.isoformat(), "Notes", self.db_path)
+        self.assertEqual(get_booking(existing, self.db_path)["activity"], "Kept existing")
+        set_vehicle_blocked(vehicle_id, False, db_path=self.db_path)
+        vehicle = get_vehicle(vehicle_id, self.db_path)
+        self.assertIsNone(vehicle_block_bounds(vehicle))
+        self.assertEqual(vehicle["blocked_reason"], "")
+        self.assertEqual(vehicle["active"], 1)
+        create_booking(vehicle_id, "Now allowed", period, end.isoformat(), "", "", "Second", self.db_path)
+
+    def test_open_ended_expired_and_invalid_vehicle_blocks(self) -> None:
+        vehicle_id = add_vehicle({"label": "OPEN-BLOCK"}, self.db_path)
+        today = date.today()
+        period = f"KW{today.isocalendar().week:02d}-{today.isocalendar().year}"
+        set_vehicle_blocked(vehicle_id, True, db_path=self.db_path)
+        with self.assertRaises(BookingConflict):
+            create_booking(
+                vehicle_id, "Future", period, (today + timedelta(days=400)).isoformat(), "", "", "planner", self.db_path,
+            )
+        for invalid in ("not-a-date", (today - timedelta(days=1)).isoformat()):
+            with self.subTest(until=invalid), self.assertRaises(ValueError):
+                set_vehicle_blocked(vehicle_id, True, until=invalid, db_path=self.db_path)
+        with self.assertRaises(ValueError):
+            set_vehicle_blocked(vehicle_id, True, reason="x" * 2001, db_path=self.db_path)
+        self.assertEqual(vehicle_block_bounds(get_vehicle(vehicle_id, self.db_path))[1], date.max)
+        with connect(self.db_path) as db:
+            db.execute(
+                "UPDATE vehicles SET blocked_from = ?, blocked_until = ? WHERE id = ?",
+                ((today - timedelta(days=2)).isoformat(), (today - timedelta(days=1)).isoformat(), vehicle_id),
+            )
+        self.assertIsNone(vehicle_block_bounds(get_vehicle(vehicle_id, self.db_path)))
+        create_booking(vehicle_id, "Expired", period, today.isoformat(), "", "", "planner", self.db_path)
+
+    def test_edit_lease_and_revision_prevent_stale_overwrites(self) -> None:
+        vehicle_id = add_vehicle({"label": "EDIT-CAR"}, self.db_path)
+        booking_id = create_booking(vehicle_id, "Original", "KW24-2026", "2026-06-12", "", "", "planner", self.db_path)
+        original = get_booking(booking_id, self.db_path)
+        self.assertIsNone(acquire_booking_edit(booking_id, "token-one", "First", self.db_path))
+        self.assertEqual(acquire_booking_edit(booking_id, "token-two", "Second", self.db_path), "First")
+        before = planner_revision(self.db_path)
+        with connect(self.db_path) as db:
+            db.execute("UPDATE bookings SET description = 'Another change' WHERE id = ?", (booking_id,))
+        self.assertGreater(planner_revision(self.db_path), before)
+        with self.assertRaises(BookingChanged):
+            update_booking(
+                booking_id, vehicle_id, "Stale", "KW24-2026", "2026-06-12", "",
+                self.db_path, expected_revision=original["revision"], edit_token="token-one",
+            )
+        self.assertEqual(get_booking(booking_id, self.db_path)["description"], "Another change")
+        release_booking_edit(booking_id, "token-one", self.db_path)
+        self.assertIsNone(acquire_booking_edit(booking_id, "token-two", "Second", self.db_path))
+
+    def test_expired_edit_lease_can_be_taken_over_and_old_token_cannot_save(self) -> None:
+        vehicle_id = add_vehicle({"label": "EXPIRED-EDIT"}, self.db_path)
+        booking_id = create_booking(vehicle_id, "Original", "KW24-2026", "2026-06-12", "", "", "planner", self.db_path)
+        revision = get_booking(booking_id, self.db_path)["revision"]
+        self.assertIsNone(acquire_booking_edit(booking_id, "old", "First", self.db_path))
+        with connect(self.db_path) as db:
+            db.execute("UPDATE booking_edit_leases SET expires_at = 0 WHERE booking_id = ?", (booking_id,))
+        self.assertIsNone(acquire_booking_edit(booking_id, "new", "Second", self.db_path))
+        release_booking_edit(booking_id, "old", self.db_path)
+        with self.assertRaises(BookingChanged):
+            update_booking(
+                booking_id, vehicle_id, "Old edit", "KW24-2026", "2026-06-12", "",
+                self.db_path, expected_revision=revision, edit_token="old",
+            )
+        self.assertEqual(acquire_booking_edit(booking_id, "old", "First", self.db_path), "Second")
 
     def test_duplicate_vehicle_labels_keep_booking_foreign_keys(self) -> None:
         first_id = add_vehicle({"label": "PT1023", "group_name": "MLBevo"}, self.db_path)
@@ -128,6 +279,8 @@ class PlannerStoreTests(unittest.TestCase):
         admin_id = list_users(self.db_path)[0]["id"]
         with self.assertRaisesRegex(ValueError, "last active admin"):
             update_user_access(admin_id, "planner", True, self.db_path)
+        with self.assertRaisesRegex(ValueError, "last active admin"):
+            update_user_access(admin_id, None, False, self.db_path)
 
     def test_login_lockout_clears_after_successful_authentication(self) -> None:
         for _ in range(5):
@@ -200,6 +353,21 @@ class PlannerStoreTests(unittest.TestCase):
         self.assertEqual(get_booking(booking_id, self.db_path)["status"], "creation_error")
         reapprove_failed_booking(booking_id, self.db_path)
         self.assertTrue(claim_booking_creation(booking_id, self.db_path))
+
+    def test_pending_ticket_claim_rejects_stale_and_duplicate_previews(self) -> None:
+        vehicle_id = add_vehicle({"label": "PT1023"}, self.db_path)
+        booking_id = create_booking(
+            vehicle_id, "Campaign", "KW47-2026", "", "", "", "planner", self.db_path
+        )
+        revision = get_booking(booking_id, self.db_path)["revision"]
+        with connect(self.db_path) as db:
+            db.execute("UPDATE bookings SET description = 'Changed' WHERE id = ?", (booking_id,))
+        self.assertFalse(claim_pending_booking_creation(booking_id, "reviewer", revision, "analysis_checklist", self.db_path))
+        revision = get_booking(booking_id, self.db_path)["revision"]
+        self.assertTrue(claim_pending_booking_creation(booking_id, "reviewer", revision, "analysis_checklist", self.db_path))
+        self.assertFalse(claim_pending_booking_creation(booking_id, "other", revision, "analysis_checklist", self.db_path))
+        booking = get_booking(booking_id, self.db_path)
+        self.assertEqual((booking["status"], booking["reviewed_by"]), ("creating", "reviewer"))
 
     def test_workbook_import_merges_existing_vehicles_and_runs_once(self) -> None:
         existing_vehicle_id = add_vehicle(

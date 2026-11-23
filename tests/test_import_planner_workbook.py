@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -12,6 +15,39 @@ from import_planner_workbook import read_vehicle_tab_history, read_workbook
 
 
 class WorkbookImportTests(unittest.TestCase):
+    def test_packaged_import_uses_workbook_beside_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "Jahreskalender"
+            sheet["B8"] = "Name"
+            for column, heading in enumerate(
+                ("Logger", "Baureihe", "Cluster", "Markt", "VR-Stand", "Verwendungszweck", "VIN"), start=3
+            ):
+                sheet.cell(row=8, column=column, value=heading)
+            sheet["J8"] = datetime(2026, 11, 18)
+            sheet["B9"] = "Test vehicle"
+            sheet["J9"] = "Test activity"
+            workbook.save(directory / "DLCM_FZG_Planung.xlsx")
+            env = os.environ.copy()
+            env["PYTHON_DOTENV_DISABLED"] = "1"
+            env["APP_DATABASE_PATH"] = str(directory / "planner.sqlite3")
+            result = subprocess.run(
+                [
+                    sys.executable, "-c",
+                    "import runpy, sys; sys.frozen = True; sys.executable = sys.argv[1]; "
+                    "sys.argv = ['import_planner_workbook']; "
+                    "runpy.run_module('import_planner_workbook', run_name='__main__')",
+                    str(directory / "JiraManager.exe"),
+                ],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Vehicle records: 1", result.stdout)
+            self.assertIn("Planned activity bookings: 1", result.stdout)
+            self.assertIn("DRY-RUN only", result.stdout)
+
     def test_reads_vehicle_fields_and_dated_activities(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "calendar.xlsx"

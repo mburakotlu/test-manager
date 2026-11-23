@@ -14,7 +14,7 @@ BOOKING = {
     "period": "KW24-2026",
     "date_label": "12 Jun 2026 – 14 Jun 2026",
     "created_by": "Tester",
-    "description": "Bring the logger",
+    "description": "Bring the logger <script>alert(1)</script>",
 }
 SMTP_ENV = {
     "BOOKING_NOTIFY_TO": "approver@example.com, lead@example.com",
@@ -39,20 +39,32 @@ class BookingNotificationTests(unittest.TestCase):
     def test_email_content_is_single_line_in_headers(self) -> None:
         with patch.dict(os.environ, SMTP_ENV, clear=True):
             settings = load_mail_settings()
-        message = build_booking_submitted_email(settings, BOOKING, "https://planner.example.com/planner/review")
+        message = build_booking_submitted_email(
+            settings, BOOKING, "https://planner.example.com/planner/review",
+            approve_url="https://planner.example.com/approve", reject_url="https://planner.example.com/reject",
+        )
         self.assertNotIn("\n", message["Subject"])
         self.assertIsNone(message["Bcc"])
         self.assertEqual(message["To"], "approver@example.com, lead@example.com")
-        body = message.get_content()
+        body = message.get_body(preferencelist=("plain",)).get_content()
         self.assertIn("Booking ID: #7", body)
         self.assertIn("Submitted by: Tester", body)
         self.assertIn("Bring the logger", body)
         self.assertIn("https://planner.example.com/planner/review", body)
+        html_body = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn('href="https://planner.example.com/approve"', html_body)
+        self.assertIn('href="https://planner.example.com/reject"', html_body)
+        self.assertIn("Preview and approve", html_body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html_body)
+        self.assertNotIn("<script>", html_body)
 
     def test_smtp_delivery_uses_starttls_and_login(self) -> None:
         with patch.dict(os.environ, SMTP_ENV, clear=True):
             settings = load_mail_settings()
-        message = build_booking_submitted_email(settings, BOOKING, "https://planner.example.com/planner/review")
+        message = build_booking_submitted_email(
+            settings, BOOKING, "https://planner.example.com/planner/review",
+            approve_url="https://planner.example.com/approve", reject_url="https://planner.example.com/reject",
+        )
         with patch("booking_notifications.smtplib.SMTP") as smtp:
             client = smtp.return_value
             self.assertEqual(send_email(settings, message), "sent via smtp.example.com")

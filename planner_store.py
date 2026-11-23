@@ -25,6 +25,14 @@ MIN_PASSWORD_LENGTH = 12
 MAX_VEHICLE_COMMENT_LENGTH = 2000
 
 
+class BookingConflict(ValueError):
+    """The selected vehicle has a booking during the requested dates."""
+
+
+class BookingChanged(ValueError):
+    """The booking changed since the edit form was opened."""
+
+
 def database_path() -> Path:
     configured = os.environ.get("APP_DATABASE_PATH", "").strip()
     return Path(configured).expanduser().resolve() if configured else APP_DIR / "data" / "planner.sqlite3"
@@ -118,6 +126,10 @@ def initialize_database(db_path: str | Path | None = None) -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS audit_events_created_at_idx ON audit_events(created_at);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         db.execute("CREATE INDEX IF NOT EXISTS vehicles_label_idx ON vehicles(label COLLATE NOCASE)")
@@ -132,6 +144,8 @@ def initialize_database(db_path: str | Path | None = None) -> None:
             )
         if "progress" not in booking_columns:
             db.execute("ALTER TABLE bookings ADD COLUMN progress TEXT NOT NULL DEFAULT 'not_started'")
+        if "revision" not in booking_columns:
+            db.execute("ALTER TABLE bookings ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
         vehicle_columns = {row["name"] for row in db.execute("PRAGMA table_info(vehicles)")}
         for column, definition in (
             ("group_name", "TEXT NOT NULL DEFAULT ''"),
@@ -145,6 +159,42 @@ def initialize_database(db_path: str | Path | None = None) -> None:
         vehicle_columns = {row["name"] for row in db.execute("PRAGMA table_info(vehicles)")}
         if "comment" not in vehicle_columns:
             db.execute("ALTER TABLE vehicles ADD COLUMN comment TEXT NOT NULL DEFAULT ''")
+        for column in ("blocked_from", "blocked_until", "blocked_reason"):
+            if column not in vehicle_columns:
+                db.execute(f"ALTER TABLE vehicles ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS booking_edit_leases (
+                booking_id INTEGER PRIMARY KEY REFERENCES bookings(id) ON DELETE CASCADE,
+                token TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS planner_change_counter (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO planner_change_counter (id) VALUES (1);
+            CREATE TRIGGER IF NOT EXISTS booking_revision_update AFTER UPDATE ON bookings
+            WHEN NEW.revision = OLD.revision
+            BEGIN
+                UPDATE bookings SET revision = OLD.revision + 1 WHERE id = NEW.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS planner_bookings_insert AFTER INSERT ON bookings
+            BEGIN UPDATE planner_change_counter SET revision = revision + 1 WHERE id = 1; END;
+            CREATE TRIGGER IF NOT EXISTS planner_bookings_update AFTER UPDATE ON bookings
+            WHEN NEW.revision = OLD.revision
+            BEGIN UPDATE planner_change_counter SET revision = revision + 1 WHERE id = 1; END;
+            CREATE TRIGGER IF NOT EXISTS planner_bookings_delete AFTER DELETE ON bookings
+            BEGIN UPDATE planner_change_counter SET revision = revision + 1 WHERE id = 1; END;
+            CREATE TRIGGER IF NOT EXISTS planner_vehicles_insert AFTER INSERT ON vehicles
+            BEGIN UPDATE planner_change_counter SET revision = revision + 1 WHERE id = 1; END;
+            CREATE TRIGGER IF NOT EXISTS planner_vehicles_update AFTER UPDATE ON vehicles
+            BEGIN UPDATE planner_change_counter SET revision = revision + 1 WHERE id = 1; END;
+            CREATE TRIGGER IF NOT EXISTS planner_vehicles_delete AFTER DELETE ON vehicles
+            BEGIN UPDATE planner_change_counter SET revision = revision + 1 WHERE id = 1; END;
+            """
+        )
 
 
 def _migrate_vehicle_labels(path: Path) -> None:
@@ -332,6 +382,21 @@ def list_users(db_path: str | Path | None = None) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def rename_user(user_id: int, username: str, db_path: str | Path | None = None) -> str:
+    username = validate_username(username)
+    with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        user = db.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            raise ValueError("User account not found.")
+        if db.execute(
+            "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE AND id != ?", (username, user_id)
+        ).fetchone():
+            raise ValueError("That username is already in use.")
+        db.execute("UPDATE users SET username = ? WHERE id = ?", (username, user_id))
+    return user["username"]
+
+
 def record_audit_event(
     actor: str,
     action: str,
@@ -359,18 +424,52 @@ def list_audit_events(limit: int = 500, db_path: str | Path | None = None) -> li
     return [dict(row) for row in rows]
 
 
+def list_recent_booking_events(db_path: str | Path | None = None) -> list[dict[str, Any]]:
+    """Return the latest recorded booking submissions, edits, and rejections."""
+    with connect(db_path) as db:
+        rows = db.execute(
+            """SELECT actor, action, details, created_at FROM audit_events
+               WHERE action LIKE 'Submitted booking #%'
+                  OR action LIKE 'Edited booking #%'
+                  OR action = 'Booking rejected'
+               ORDER BY id DESC LIMIT 5"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_help_contact(db_path: str | Path | None = None) -> str:
+    with connect(db_path) as db:
+        row = db.execute("SELECT value FROM app_settings WHERE key = 'help_contact'").fetchone()
+    return row["value"] if row else ""
+
+
+def set_help_contact(name: str, db_path: str | Path | None = None) -> None:
+    name = name.strip()
+    if not name or len(name) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("Enter a name of 1–80 characters without control characters.")
+    with connect(db_path) as db:
+        db.execute(
+            """INSERT INTO app_settings (key, value) VALUES ('help_contact', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (name,),
+        )
+
+
 def update_user_access(
     user_id: int,
-    role: str,
+    role: str | None,
     active: bool,
     db_path: str | Path | None = None,
 ) -> None:
-    if role not in ROLES:
+    if role is not None and role not in ROLES:
         raise ValueError("Unknown user role.")
     with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
         user = db.execute("SELECT role, active FROM users WHERE id = ?", (user_id,)).fetchone()
         if not user:
             raise ValueError("User account not found.")
+        if role is None:
+            role = user["role"]
         if user["role"] == "admin" and user["active"] and (role != "admin" or not active):
             enabled_admins = db.execute(
                 "SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1"
@@ -509,6 +608,48 @@ def update_vehicle_comment(vehicle_id: int, comment: str, db_path: str | Path | 
             raise ValueError("Vehicle not found.")
 
 
+def vehicle_block_bounds(vehicle: dict[str, Any]) -> tuple[date, date] | None:
+    """Return a current temporary block, ignoring blocks whose end date has passed."""
+    raw_start = vehicle.get("blocked_from", "")
+    if not raw_start:
+        return None
+    start = date.fromisoformat(raw_start)
+    end = date.fromisoformat(vehicle["blocked_until"]) if vehicle.get("blocked_until") else date.max
+    return (start, end) if end >= date.today() else None
+
+
+def set_vehicle_blocked(
+    vehicle_id: int, blocked: bool, reason: str = "", until: str = "",
+    db_path: str | Path | None = None,
+) -> None:
+    """Set today's temporary block or clear it without changing bookings or active status."""
+    reason = reason.strip()
+    until = until.strip()
+    if blocked:
+        if len(reason) > MAX_VEHICLE_COMMENT_LENGTH:
+            raise ValueError(f"Block reason must be at most {MAX_VEHICLE_COMMENT_LENGTH} characters.")
+        if until:
+            try:
+                end = date.fromisoformat(until)
+            except ValueError as exc:
+                raise ValueError("Choose a valid block end date.") from exc
+            if end < date.today():
+                raise ValueError("Block end date cannot be before today.")
+            until = end.isoformat()
+    with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        vehicle = db.execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+        if vehicle is None:
+            raise ValueError("Vehicle not found.")
+        current = vehicle_block_bounds(dict(vehicle))
+        start = (current[0] if current else date.today()).isoformat() if blocked else ""
+        db.execute(
+            """UPDATE vehicles SET blocked_from = ?, blocked_until = ?, blocked_reason = ?,
+               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+            (start, until if blocked else "", reason if blocked else "", vehicle_id),
+        )
+
+
 def get_vehicle(vehicle_id: int, db_path: str | Path | None = None) -> dict[str, Any] | None:
     with connect(db_path) as db:
         row = db.execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
@@ -564,6 +705,56 @@ def update_vehicle_groups(
     return len(workbook_vehicles)
 
 
+def booking_date_bounds(booking: dict[str, Any]) -> tuple[date, date] | None:
+    """Resolve explicit dates or a week-only booking's Monday through Friday."""
+    planned_date = booking["planned_date"].strip()
+    if planned_date:
+        start = date.fromisoformat(planned_date)
+    else:
+        match = re.fullmatch(r"KW(\d{1,2})(?:-(\d{4}))?", booking["period"].strip().upper())
+        if not match:
+            return None
+        year = int(match.group(2)) if match.group(2) else date.today().isocalendar().year
+        try:
+            start = date.fromisocalendar(year, int(match.group(1)), 1)
+        except ValueError:
+            return None
+    raw_end = booking.get("planned_end_date", "").strip()
+    end = date.fromisoformat(raw_end) if raw_end else start + timedelta(days=4 if not planned_date else 0)
+    if end < start:
+        raise ValueError("A booking end date cannot be before its start date.")
+    return start, end
+
+
+def _check_booking_availability(
+    db: sqlite3.Connection, vehicle_id: int, fields: dict[str, Any], exclude_id: int | None = None,
+) -> None:
+    requested = booking_date_bounds(fields)
+    if requested is None:
+        raise ValueError("Choose a valid planned week or date.")
+    vehicle = dict(db.execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone())
+    blocked = vehicle_block_bounds(vehicle)
+    if blocked and requested[0] <= blocked[1] and blocked[0] <= requested[1]:
+        until = f" through {blocked[1].isoformat()}" if blocked[1] != date.max else " until unblocked"
+        reason = f" Reason: {vehicle['blocked_reason']}" if vehicle["blocked_reason"] else ""
+        raise BookingConflict(
+            f"Vehicle is BLOCKED — not ready for testing from {blocked[0].isoformat()}{until}.{reason}"
+        )
+    rows = db.execute(
+        """SELECT id, activity, period, planned_date, planned_end_date, created_by
+           FROM bookings WHERE vehicle_id = ? AND status != 'rejected' AND id != ?
+           ORDER BY id""",
+        (vehicle_id, exclude_id if exclude_id is not None else -1),
+    )
+    for row in rows:
+        existing = booking_date_bounds(dict(row))
+        if existing and requested[0] <= existing[1] and existing[0] <= requested[1]:
+            raise BookingConflict(
+                f"Vehicle already booked for {existing[0].isoformat()} to {existing[1].isoformat()}: "
+                f"{row['activity']} (booked by {row['created_by']})."
+            )
+
+
 def create_booking(
     vehicle_id: int,
     activity: str,
@@ -582,9 +773,11 @@ def create_booking(
         activity, period, planned_date, planned_end_date, description, activity_color
     )
     with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
         vehicle = db.execute("SELECT id FROM vehicles WHERE id = ? AND active = 1", (vehicle_id,)).fetchone()
         if not vehicle:
             raise ValueError("Select an active vehicle.")
+        _check_booking_availability(db, vehicle_id, fields)
         result = db.execute(
             """INSERT INTO bookings
                (vehicle_id, activity, period, planned_date, planned_end_date, description,
@@ -616,6 +809,8 @@ def update_booking(
     *,
     planned_end_date: str = "",
     activity_color: str = "",
+    expected_revision: int | None = None,
+    edit_token: str | None = None,
 ) -> list[str]:
     """Update a booking still under review; returns names of changed fields."""
     fields = {
@@ -625,17 +820,29 @@ def update_booking(
         ),
     }
     with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
         current = db.execute(
             "SELECT * FROM bookings WHERE id = ? AND status IN ('pending', 'approved') AND jira_issue_key = ''",
             (booking_id,),
         ).fetchone()
         if current is None:
             raise ValueError("Only pending or approved bookings without a Jira ticket can be edited.")
+        if expected_revision is not None and current["revision"] != expected_revision:
+            raise BookingChanged("This booking was changed by someone else. Reload it before saving.")
+        if edit_token is not None:
+            lease = db.execute(
+                "SELECT token FROM booking_edit_leases WHERE booking_id = ? AND expires_at > unixepoch('now')",
+                (booking_id,),
+            ).fetchone()
+            if lease is None or lease["token"] != edit_token:
+                raise BookingChanged("Your edit session expired or another person is editing. Reload before saving.")
         if vehicle_id != current["vehicle_id"] and not db.execute(
             "SELECT 1 FROM vehicles WHERE id = ? AND active = 1", (vehicle_id,)
         ).fetchone():
             raise ValueError("Select an active vehicle.")
         changed = [name for name, value in fields.items() if current[name] != value]
+        if any(name in changed for name in ("vehicle_id", "period", "planned_date", "planned_end_date")):
+            _check_booking_availability(db, vehicle_id, fields, exclude_id=booking_id)
         if not changed:
             return []
         result = db.execute(
@@ -647,6 +854,48 @@ def update_booking(
         if result.rowcount != 1:
             raise ValueError("Only pending or approved bookings without a Jira ticket can be edited.")
         return changed
+
+
+def acquire_booking_edit(booking_id: int, token: str, actor: str, db_path: str | Path | None = None) -> str | None:
+        """Acquire or renew a short edit lease; return the other editor's name if occupied."""
+        with connect(db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            booking = db.execute(
+                "SELECT id FROM bookings WHERE id = ? AND status IN ('pending', 'approved') AND jira_issue_key = ''",
+                (booking_id,),
+            ).fetchone()
+            if booking is None:
+                raise ValueError("This booking is no longer available for editing.")
+            lease = db.execute(
+                """SELECT token, actor FROM booking_edit_leases
+                   WHERE booking_id = ? AND expires_at > CAST(strftime('%s', 'now') AS INTEGER)""",
+                (booking_id,),
+            ).fetchone()
+            if lease is not None and lease["token"] != token:
+                return lease["actor"]
+            db.execute(
+                """INSERT INTO booking_edit_leases (booking_id, token, actor, expires_at)
+                   VALUES (?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER) + 120)
+                   ON CONFLICT(booking_id) DO UPDATE SET token = excluded.token, actor = excluded.actor,
+                       expires_at = excluded.expires_at""",
+                (booking_id, token, actor),
+            )
+        return None
+
+
+def release_booking_edit(booking_id: int, token: str, db_path: str | Path | None = None) -> None:
+        with connect(db_path) as db:
+            db.execute("DELETE FROM booking_edit_leases WHERE booking_id = ? AND token = ?", (booking_id, token))
+
+
+def release_user_edits(token: str, db_path: str | Path | None = None) -> None:
+        with connect(db_path) as db:
+            db.execute("DELETE FROM booking_edit_leases WHERE token = ?", (token,))
+
+
+def planner_revision(db_path: str | Path | None = None) -> int:
+        with connect(db_path) as db:
+            return int(db.execute("SELECT revision FROM planner_change_counter WHERE id = 1").fetchone()[0])
 
 
 def _validated_booking_fields(
@@ -729,7 +978,7 @@ def list_bookings(
         clauses.append("b.vehicle_id = ?")
         params.append(vehicle_id)
     query = """SELECT b.*, v.label AS vehicle_label, v.vin AS vehicle_vin,
-                      v.jira_asset_key AS jira_asset_key
+                      v.jira_asset_key AS jira_asset_key, v.blocked_from, v.blocked_until, v.blocked_reason
                FROM bookings b JOIN vehicles v ON v.id = b.vehicle_id"""
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
@@ -744,7 +993,7 @@ def get_booking(booking_id: int, db_path: str | Path | None = None) -> dict[str,
         row = db.execute(
             """SELECT b.*, v.label AS vehicle_label, v.logger, v.series, v.cluster,
                       v.market, v.vr_stand, v.purpose, v.vin AS vehicle_vin,
-                      v.jira_asset_key
+                      v.jira_asset_key, v.blocked_from, v.blocked_until, v.blocked_reason
                FROM bookings b JOIN vehicles v ON v.id = b.vehicle_id
                WHERE b.id = ?""",
             (booking_id,),
@@ -757,6 +1006,8 @@ def review_booking(
     status: str,
     reviewer: str,
     db_path: str | Path | None = None,
+    *,
+    expected_revision: int | None = None,
 ) -> None:
     if status not in ("approved", "rejected", "pending"):
         raise ValueError("Review status must be approved, rejected, or returned to pending.")
@@ -766,8 +1017,9 @@ def review_booking(
             """UPDATE bookings
                SET status = ?, reviewed_by = ?, updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND (status = ? OR (? = 'rejected' AND status = 'approved'))
-                   AND jira_issue_key = ''""",
-            (status, reviewer, booking_id, expected_status, status),
+                   AND jira_issue_key = ''
+                   AND (? IS NULL OR (revision = ? AND status = 'pending'))""",
+            (status, reviewer, booking_id, expected_status, status, expected_revision, expected_revision),
         )
         if result.rowcount != 1:
             raise ValueError("Booking not found, already processed, or no longer available for review.")
@@ -801,6 +1053,22 @@ def claim_booking_creation(
                    checklist_template = COALESCE(?, checklist_template), updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND status = 'approved' AND jira_issue_key = ''""",
             (checklist_template, booking_id),
+        )
+        return result.rowcount == 1
+
+
+def claim_pending_booking_creation(
+    booking_id: int, reviewer: str, expected_revision: int, checklist_template: str,
+    db_path: str | Path | None = None,
+) -> bool:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", checklist_template):
+        raise ValueError("Invalid checklist template.")
+    with connect(db_path) as db:
+        result = db.execute(
+            """UPDATE bookings SET status = 'creating', reviewed_by = ?, error_code = '',
+                   checklist_template = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND status = 'pending' AND revision = ? AND jira_issue_key = ''""",
+            (reviewer, checklist_template, booking_id, expected_revision),
         )
         return result.rowcount == 1
 

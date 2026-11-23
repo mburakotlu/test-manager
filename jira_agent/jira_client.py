@@ -535,6 +535,24 @@ class JiraClient:
         return {"posted": True, "dry_run": False, "key": key, "deleted": True}
 
     # -- issue creation ----------------------------------------------------
+    def get_issue_create_fields(self, project_key: str, issue_type: str) -> dict[str, Any]:
+        """Return fields available on the project's issue creation screen."""
+        data = self._get(
+            f"{self._api}/issue/createmeta",
+            params={
+                "projectKeys": project_key,
+                "issuetypeNames": issue_type,
+                "expand": "projects.issuetypes.fields",
+            },
+        )
+        for project in data.get("projects", []):
+            if project.get("key") != project_key:
+                continue
+            for kind in project.get("issuetypes", []):
+                if kind.get("name") == issue_type and isinstance(kind.get("fields"), dict):
+                    return kind["fields"]
+        raise ValueError(f"Jira did not return creation fields for {project_key} {issue_type}.")
+
     def create_issue(
         self,
         project_key: str,

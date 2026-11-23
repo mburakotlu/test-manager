@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import html
 import hmac
+import json
 import os
 import re
 import secrets
@@ -27,8 +28,10 @@ from calendar import month_name
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
-from flask import Flask, abort, redirect, request, session, url_for
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from app_paths import APP_DIR, APP_VERSION
 
 # Loaded here (not just in main.py) so `python webapp.py` also works without
@@ -37,10 +40,10 @@ load_dotenv(APP_DIR / ".env")
 
 from jira_agent.browser_checklist import save_pending_checklists, write_checklists_via_browser
 from jira_agent.checklist import render_test_checklist
-from jira_agent.config import load_config
+from jira_agent.config import VEHICLE_ASSET_FIELD_ID, load_config
 from jira_agent.jira_client import JiraClient
 from jira_agent.asset_vehicles import (
-    history_attribute_id, load_asset_vehicles, save_asset_history,
+    HISTORY_NAME, history_attribute_id, load_asset_vehicles, save_asset_history,
     save_asset_tickets, ticket_attribute_id,
 )
 from jira_agent.register import RegisterEntry, append_entry, load_entries
@@ -54,24 +57,35 @@ from booking_notifications import (
 )
 from planner_store import (
     authenticate,
+    acquire_booking_edit,
+    booking_date_bounds,
+    BookingChanged,
+    BookingConflict,
     change_password as set_user_password,
     claim_booking_creation,
+    claim_pending_booking_creation,
     complete_booking_creation,
     create_booking,
     create_user,
     get_booking,
+    get_help_contact,
     get_user,
     get_vehicle,
     initialize_database,
     clear_login_failures,
     login_is_locked,
     list_audit_events,
+    list_recent_booking_events,
     list_bookings,
     list_imported_activity_colors,
     list_users,
     list_vehicles,
+    planner_revision,
     record_audit_event,
     record_login_failure,
+    rename_user,
+    release_booking_edit,
+    release_user_edits,
     reapprove_failed_booking,
     review_booking,
     update_booking,
@@ -81,6 +95,9 @@ from planner_store import (
     update_vehicle,
     update_vehicle_comment,
     set_vehicle_active,
+    set_vehicle_blocked,
+    set_help_contact,
+    vehicle_block_bounds,
     count_vehicle_bookings,
     delete_vehicle,
     MAX_VEHICLE_COMMENT_LENGTH,
@@ -95,8 +112,8 @@ TEAM_ENDPOINTS = {
     "login",
     "identify_user",
     "logout",
-    "log_view",
     "team_dashboard",
+    "navigation_search",
     "campaign_planner",
     "my_bookings",
     "activity_history",
@@ -106,7 +123,11 @@ TEAM_ENDPOINTS = {
     "submit_booking",
     "edit_booking",
     "review_booking_action",
+    "email_booking_review",
     "booking_progress",
+    "booking_edit_heartbeat",
+    "booking_edit_release",
+    "planner_updates",
     "retry_failed_booking",
     "create_booking_ticket",
     "vehicle_create",
@@ -153,7 +174,7 @@ def recent_log_entries(limit: int = 5) -> list[dict[str, str]]:
     with _LOG_LOCK:
         return list(reversed(_LOG[-limit:]))
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=str(APP_DIR / "static"), template_folder=str(APP_DIR / "templates"))
 app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_hex(32)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -165,6 +186,15 @@ initialize_database()
 
 PAGE = """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title}</title>
+<script>
+try {{
+  const savedTheme = localStorage.getItem("dlcm-theme");
+  document.documentElement.dataset.theme = savedTheme === "light" || savedTheme === "dark"
+    ? savedTheme : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+}} catch (error) {{
+  document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}}
+</script>{dashboard_head}
 <style>
 * {{ box-sizing: border-box; }}
 body {{ font-family: "Segoe UI", Arial, sans-serif; margin: 0; background: #f3f6fa; color: #243447; line-height: 1.5; }}
@@ -218,10 +248,26 @@ a {{ color: #1769aa; }}
 .approver-dropdown-options {{ position: absolute; z-index: 20; left: 0; right: 0; margin-top: 0.25em; max-height: 240px; overflow-y: auto; background: #fff; border: 1px solid #c8d4e0; border-radius: 7px; box-shadow: 0 8px 20px rgba(29,53,80,.15); padding: 0.3em 0; }}
 .activity-color-options .approver-dropdown-options label {{ display: flex; margin: 0; padding: 0.45em 0.8em; }}
 .approver-dropdown-options label:hover {{ background: #edf7ff; }}
-.vehicle-comment summary {{ list-style: none; cursor: pointer; min-width: 9em; max-width: 18em; white-space: pre-wrap; overflow-wrap: anywhere; }}
-.vehicle-comment summary::-webkit-details-marker {{ display: none; }}
-.vehicle-comment textarea {{ min-width: 16em; }}
+.vehicle-comment-text {{ white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9em; }}
+.vehicle-panel table tr.vehicle-comment-note-row > td {{ background: #f5f5f4; border-left: 4px solid #8a8a85; padding: 0.6em 1em; }}
 .vehicle-comment-field {{ grid-column: 1 / -1; }}
+.vehicle-dialog {{ width: min(680px, calc(100% - 2em)); max-height: 85vh; overflow-y: auto; border: 1px solid #dededb; border-radius: 8px; padding: 1.25em; color: #242424; }}
+.vehicle-dialog::backdrop {{ background: rgba(0,0,0,.35); }}
+.vehicle-dialog-heading {{ display: flex; justify-content: space-between; align-items: center; gap: 1em; margin-bottom: 1em; }}
+.vehicle-dialog-heading h2 {{ margin: 0; }}
+.vehicle-blocked-label {{ display: block; color: #a31919; font-size: 0.9em; font-weight: 600; }}
+.vehicle-block-status {{ margin: 0; white-space: normal; overflow-wrap: anywhere; }}
+.vehicle-panel table tr.vehicle-block-note-row > td {{ background: #fff1f1; border-left: 4px solid #b42318; padding: 0.6em 1em; }}
+.vehicle-actions > summary {{ cursor: pointer; list-style: none; text-align: center; border: 1px solid #bfbfba; border-radius: 5px; padding: 0.15em 0.65em; font-size: 1.3em; }}
+.vehicle-actions > summary::-webkit-details-marker {{ display: none; }}
+.vehicle-actions-list {{ display: grid; gap: 0.4em; min-width: 11em; padding-top: 0.6em; }}
+.vehicle-actions-list > a {{ padding: 0.35em 0.5em; text-decoration: none; border-radius: 4px; }}
+.vehicle-actions-list > a:hover {{ background: #eee; }}
+.vehicle-actions-list button {{ width: 100%; text-align: left; }}
+.vehicle-actions-list .vehicle-reactivate-form {{ margin-left: 0 !important; }}
+.vehicle-block-switch[aria-checked="true"] {{ background: #a31919; }}
+.vehicle-panel table tr.vehicle-blocked-row > td {{ background: #fde2e2; }}
+.vehicle-panel table tr.vehicle-blocked-row:hover > td {{ background: #f8cccc; }}
 label {{ display: block; margin: 0.7em 0; font-weight: 600; color: #354b60; }}
 input[type=text], input[type=password], input[type=date], textarea, select {{ width: 100%; border: 1px solid #c8d4e0; border-radius: 7px; padding: 0.68em 0.8em; margin-top: 0.3em; background: #fff; color: #243447; font: inherit; transition: border-color .15s, box-shadow .15s; }}
 input:focus, textarea:focus, select:focus {{ outline: none; border-color: #3182ce; box-shadow: 0 0 0 3px rgba(49,130,206,.16); }}
@@ -291,6 +337,12 @@ tbody tr:hover td, table tr:hover td {{ background: #f7fbff; }}
 .history-grid th, .history-grid td {{ min-width: 105px; padding: 0.3em 0.4em; text-align: center; vertical-align: middle; border-right: 1px solid #e1e8ef; }}
 .history-grid th.grid-day-col, .history-grid td.grid-day-cell {{ width: 40px; min-width: 40px; max-width: 40px; padding: 0; text-align: center; }}
 .history-grid td.grid-day-cell {{ border-right-color: #edf1f5; border-bottom-color: #edf1f5; }}
+.history-grid td.grid-unavailable {{ position: relative; }}
+.history-grid td.grid-unavailable::after {{
+  content: ""; position: absolute; top: 0; bottom: 0;
+  left: var(--unavailable-left); width: var(--unavailable-width);
+  background: rgba(220, 38, 38, 0.3); pointer-events: none; z-index: 2;
+}}
 .history-grid .grid-activity-label {{ display: block; width: 100%; padding: 0.2em 0.3em; border: 0; border-radius: 0; color: #172a3d; background: #fff; font-size: 0.84em; line-height: 1.25; white-space: normal; overflow-wrap: break-word; }}
 .history-grid .grid-activity-label small {{ display: block; color: #46596b; font-size: 0.9em; line-height: 1.2; }}
 .history-grid thead .grid-week-col {{ border-right: 1px solid #879aab; }}
@@ -317,11 +369,12 @@ tbody tr:hover td, table tr:hover td {{ background: #f7fbff; }}
 .history-grid .grid-section-row th {{ position: sticky; left: 0; z-index: 3; padding: 0.25em 0.55em; background: #dce8f2; text-align: left; }}
 .history-grid td.grid-vehicle-col {{ background: #fff; }}
 .history-grid td.grid-filled {{ font-size: 0.9em; }}
-.vehicle-management-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 1em; margin: 1.2em 0; }}
-.vehicle-management-heading h2 {{ margin: 0; color: #1d3550; font-size: 1.2em; }}
+.vehicle-management-heading {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 1em; margin: 1.2em 0; }}
+.vehicle-management-heading h3 {{ margin: 0; border: 0; }}
+.vehicle-management-heading > button, .vehicle-management-heading > form {{ margin-left: auto; }}
 .vehicle-status-form {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em; }}
 .vehicle-status-form label {{ margin: 0; font-size: 0.9em; }}
-.vehicle-status-form select {{ width: auto; min-width: 14em; margin: 0; padding: 0.4em 0.6em; }}
+.vehicle-status-form select {{ width: auto; min-width: 0; max-width: 100%; margin: 0; padding: 0.4em 0.6em; }}
 .vehicle-status-form button {{ padding: 0.45em 0.8em; font-size: 0.88em; white-space: nowrap; }}
 .vehicle-reactivate-form {{ margin-left: 0.6em !important; }}
 .vehicle-reactivate-form button {{ white-space: nowrap; }}
@@ -334,8 +387,6 @@ tbody tr:hover td, table tr:hover td {{ background: #f7fbff; }}
 .progress-closed {{ background: #eceff3; color: #4a5a6a; border: 1px solid #ccd5df; }}
 .history-grid .grid-activity-label.grid-progress-closed, .activity-calendar-event.progress-closed-event {{ opacity: 0.55; }}
 .progress-form select {{ width: auto; margin: 0; padding: 0.3em 0.45em; font-size: 0.88em; }}
-.vehicle-list-switch {{ margin: 0 0 0.75em; font-size: 0.9em; }}
-.vehicle-list-switch a {{ font-weight: 600; }}
 .view-tabs {{ display: flex; flex-wrap: wrap; gap: 0.55em; margin: 1em 0; }}
 .view-tabs a {{ border: 1px solid #cfdae6; background: #fff; border-radius: 999px; padding: 0.4em 0.9em; text-decoration: none; font-weight: 650; }}
 .view-tabs a.selected {{ background: #1769aa; border-color: #1769aa; color: #fff; }}
@@ -376,8 +427,68 @@ fieldset label {{ width: 160px; }}
 .log-strip {{ background: #fff9e8; border: 1px solid #f0dfab; border-radius: 8px; padding: 0.8em 1em; margin-bottom: 1.2em; font-size: 0.9em; }}
 .log-strip ul {{ margin: 0.4em 0 0; padding-left: 1.2em; }}
 .log-time {{ color: #718096; margin-right: 0.5em; }}
+/* Neutral surfaces and compact controls keep the focus on the planning data. */
+body {{ background: #f5f5f4; color: #242424; }}
+nav {{ position: relative; z-index: 10; background: #151515; border-bottom: 1px solid #333; padding-block: 0.65em; }}
+nav a {{ color: #fff; }}
+nav a:hover {{ color: #ddd; }}
+nav a.workspace-tab[aria-current="page"] {{ color: #fff; box-shadow: inset 0 -2px #fff; }}
+nav button {{ background: transparent; border: 1px solid #aaa; color: #fff; }}
+nav button:hover {{ background: #3a3a3a; color: #fff; }}
+nav a:focus-visible, nav button:focus-visible {{ outline-color: #fff; }}
+.nav-search {{ display: flex; align-items: center; gap: 0.35em; margin-left: auto; }}
+.nav-search input[type=search] {{ width: min(28vw, 260px); min-width: 120px; border: 1px solid #888; border-radius: 5px; padding: 0.48em 0.7em; background: #fff; color: #242424; font: inherit; }}
+.nav-profile {{ position: relative; }}
+.nav-profile summary {{ cursor: pointer; list-style: none; border: 1px solid #aaa; border-radius: 5px; padding: 0.35em 0.7em; color: #fff; }}
+.nav-profile summary::-webkit-details-marker {{ display: none; }}
+.nav-profile summary:focus-visible {{ outline: 3px solid #fff; outline-offset: 3px; }}
+.nav-profile-panel {{ position: absolute; right: 0; top: 100%; min-width: 190px; max-width: min(90vw, 320px); padding: 0.8em; background: #fff; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.2); color: #242424; overflow-wrap: anywhere; }}
+.nav-profile-panel strong {{ display: block; margin-bottom: 0.5em; }}
+.nav-account {{ display: block; margin-bottom: 0.6em; color: #555; font-size: 0.9em; }}
+nav .nav-profile-panel form {{ margin: 0; }}
+nav .nav-profile-panel button {{ width: 100%; text-align: left; background: #242424; border-color: #242424; color: #fff; }}
+nav .nav-profile-panel button:hover {{ background: #454545; }}
+.nav-version {{ color: #ccc; font-size: 0.85em; }}
+.container {{ position: relative; z-index: 1; width: min(94%, 1440px); }}
+h1, h2, h3 {{ color: #202020; letter-spacing: -0.02em; }}
+h1 {{ font-size: clamp(1.55rem, 2.6vw, 2rem); }}
+h3 {{ border-color: #e3e3df; }}
+a {{ color: #303e4d; text-underline-offset: 0.16em; }}
+.workspace-welcome, .planner-intro, .form-hint {{ color: #626260; }}
+.workspace-grid {{ gap: 0.75em; }}
+.workspace-card {{ min-height: 135px; padding: 1.2em; border-color: #dededb; border-radius: 8px; color: #242424; box-shadow: none; }}
+.workspace-card:hover {{ border-color: #686866; box-shadow: 0 4px 16px rgba(0,0,0,.07); transform: translateY(-1px); }}
+.workspace-card strong {{ color: #202020; font-size: 1.08em; }}
+.workspace-card span {{ color: #626260; margin: 0.45em 0 0.8em; }}
+.workspace-card .workspace-card-action {{ color: #303e4d; }}
+.card, .history-stat {{ border-color: #e0e0dc; border-radius: 8px; box-shadow: none; }}
+.card {{ padding: clamp(1em, 2vw, 1.4em); }}
+label {{ color: #3a3a38; }}
+input[type=text], input[type=password], input[type=date], textarea, select {{
+  border-color: #bfbfba; border-radius: 5px; padding: 0.55em 0.7em; color: #242424;
+}}
+input:focus, textarea:focus, select:focus {{ border-color: #333; box-shadow: 0 0 0 3px rgba(35,35,35,.12); }}
+button, .button {{ background: #242424; border-radius: 5px; padding: 0.52em 0.9em; font-weight: 600; }}
+button:hover, .button:hover {{ background: #454545; }}
+.link-button, .link-button:hover {{ background: transparent; color: #303e4d; padding: 0; }}
+.danger-button {{ background: #b42318; }}
+.danger-button:hover {{ background: #8a1f1f; }}
+button:focus-visible, a:focus-visible, summary:focus-visible {{ outline: 3px solid #4b6175; outline-offset: 3px; }}
+table {{ border-color: #e0e0dc; box-shadow: none; }}
+th {{ background: #f1f1ef; color: #424240; }}
+td, th {{ border-bottom-color: #e9e9e6; }}
+tbody tr:hover td, table tr:hover td {{ background: #f7f7f5; }}
+.view-tabs a, .review-filters a {{ border-color: #c9c9c5; border-radius: 5px; padding: 0.35em 0.75em; }}
+.view-tabs a.selected, .activity-calendar-scope a.selected {{ background: #242424; border-color: #242424; color: #fff; }}
+.history-stat strong, .history-stat span {{ color: #343432; }}
+@media (prefers-reduced-motion: reduce) {{
+  *, *::before, *::after {{ transition: none !important; scroll-behavior: auto !important; }}
+}}
 @media (max-width: 700px) {{
   nav {{ gap: 0.35em 0.85em; padding: 0.75em 1em; }}
+  .nav-search {{ order: 2; width: 100%; margin-left: 0; }}
+  .nav-search input[type=search] {{ flex: 1; width: auto; min-width: 0; }}
+  .nav-profile {{ margin-left: auto; }}
   .vehicle-status-form select {{ min-width: 0; width: 100%; }}
   .vehicle-management-heading {{ flex-wrap: wrap; }}
   nav form {{ margin-left: 0; }}
@@ -390,6 +501,7 @@ fieldset label {{ width: 160px; }}
   .week-card::before {{ left: -1.43em; }}
 }}
 </style>
+<link rel="stylesheet" href="{theme_css_url}">
 <script>
 function setVehicleChecks(button, checked) {{
   const form = button.closest("form");
@@ -405,6 +517,11 @@ function updateApproverSummary(input) {{
   const summary = dropdown.querySelector("summary");
   const selected = Array.from(dropdown.querySelectorAll('input[name="notify_to"]:checked')).map(box => box.value);
   summary.textContent = selected.length ? selected.join(", ") : summary.dataset.placeholder;
+}}
+function useCurrentWeek(button, period) {{
+  const field = button.form.querySelector('input[name="period"]');
+  field.value = period;
+  field.dispatchEvent(new Event("input", {{bubbles: true}}));
 }}
 document.addEventListener("click", event => {{
   document.querySelectorAll(".approver-dropdown[open]").forEach(dropdown => {{
@@ -453,12 +570,220 @@ document.addEventListener("fullscreenchange", () => {{
     button.textContent = document.fullscreenElement === shell ? "Exit full screen" : "View grid full screen";
   }}
 }});
+document.addEventListener("DOMContentLoaded", () => {{
+  document.querySelectorAll("[data-filter-panel]").forEach(panel => {{
+    const controls = panel.querySelector("[data-filter-controls]");
+    const search = controls.querySelector("input");
+    const result = controls.querySelector("[data-filter-result]");
+    const rows = Array.from(panel.querySelectorAll("[data-filter-row]"));
+    controls.hidden = false;
+    const update = () => {{
+      const query = search.value.trim().toLocaleLowerCase();
+      let shown = 0;
+      rows.forEach(row => {{
+        const text = row.dataset.filterText || row.textContent;
+        const matches = text.toLocaleLowerCase().includes(query);
+        row.hidden = !matches;
+        if (matches) shown++;
+      }});
+      result.textContent = shown + " of " + rows.length + " shown";
+    }};
+    search.addEventListener("input", update);
+    update();
+  }});
+  const vehiclePanel = document.querySelector("[data-vehicle-filter-panel]");
+  if (vehiclePanel) {{
+    const controls = vehiclePanel.querySelector("[data-vehicle-filter-controls]");
+    const search = controls.querySelector("input");
+    const result = controls.querySelector("[data-vehicle-filter-result]");
+    const rows = Array.from(vehiclePanel.querySelectorAll("table tr"));
+    controls.hidden = false;
+    const update = () => {{
+      const query = search.value.trim().toLocaleLowerCase();
+      let group = null;
+      let groupMatches = 0;
+      let matches = true;
+      let shown = 0;
+      let total = 0;
+      rows.forEach(row => {{
+        if (row.classList.contains("vehicle-group-header")) {{
+          if (group) group.hidden = groupMatches === 0;
+          group = row;
+          groupMatches = 0;
+        }} else if (row.querySelector("[data-vehicle-search]")) {{
+          total++;
+          matches = row.querySelector("[data-vehicle-search]").dataset.vehicleSearch.toLocaleLowerCase().includes(query);
+          row.hidden = !matches;
+          if (matches) {{ shown++; groupMatches++; }}
+        }} else if (row.classList.contains("vehicle-block-note-row") || row.classList.contains("vehicle-comment-note-row")) {{
+          row.hidden = !matches;
+        }}
+      }});
+      if (group) group.hidden = groupMatches === 0;
+      result.textContent = shown + " of " + total + " vehicles shown";
+    }};
+    search.addEventListener("input", update);
+    update();
+  }}
+  const bookingForm = document.querySelector("[data-booking-form]");
+  const bookingPreview = document.querySelector("[data-booking-preview]");
+  if (bookingForm && bookingPreview) {{
+    const updatePreview = () => {{
+      const vehicle = bookingForm.querySelector('select[name="vehicle_id"]');
+      const activity = bookingForm.querySelector('input[name="activity"]').value.trim();
+      const week = bookingForm.querySelector('input[name="period"]').value.trim();
+      const start = bookingForm.querySelector('input[name="planned_date"]').value;
+      const end = bookingForm.querySelector('input[name="planned_end_date"]').value;
+      let dates = "Choose a week or dates";
+      if (end && !start) dates = "Choose a start date";
+      else if (start && end && end < start) dates = "End date is before start date";
+      else if (start) dates = end && end !== start ? start + " to " + end : start;
+      else if (week) dates = week + " (Monday to Friday)";
+      bookingPreview.querySelector("[data-preview-vehicle]").textContent =
+        vehicle.selectedOptions.length ? vehicle.selectedOptions[0].textContent : "Choose a vehicle";
+      bookingPreview.querySelector("[data-preview-activity]").textContent = activity || "Add an activity";
+      bookingPreview.querySelector("[data-preview-dates]").textContent = dates;
+      bookingPreview.querySelector("[data-preview-date-hint]").textContent =
+        start && week ? "Dates take precedence over the planned week." : "";
+    }};
+    bookingForm.addEventListener("input", updatePreview);
+    bookingForm.addEventListener("change", updatePreview);
+    updatePreview();
+  }}
+  const ticketSelection = document.querySelector("[data-ticket-selection]");
+  const ticketConfirmation = document.querySelector("[data-ticket-confirmation]");
+  if (ticketSelection && ticketConfirmation) {{
+    const original = JSON.stringify(Array.from(new FormData(ticketSelection).entries()));
+    const notice = document.querySelector("[data-ticket-selection-notice]");
+    const button = ticketConfirmation.querySelector('button[type="submit"]');
+    const updateTicketSelection = () => {{
+      const changed = JSON.stringify(Array.from(new FormData(ticketSelection).entries())) !== original;
+      notice.hidden = !changed;
+      button.disabled = changed;
+    }};
+    ticketSelection.addEventListener("input", updateTicketSelection);
+    ticketSelection.addEventListener("change", updateTicketSelection);
+  }}
+  const setupHoverMenu = profile => {{
+    const keepOpen = profile.hasAttribute("data-nav-profile");
+    let openedByHover = false;
+    let closeTimer;
+    profile.addEventListener("mouseenter", () => {{
+      clearTimeout(closeTimer);
+      if (!profile.open) {{
+        profile.open = true;
+        openedByHover = true;
+      }}
+    }});
+    profile.querySelector("summary").addEventListener("click", event => {{
+      if (openedByHover && event.detail > 0) event.preventDefault();
+      openedByHover = false;
+    }});
+    profile.addEventListener("mouseleave", () => {{
+      openedByHover = false;
+      if (keepOpen) return;
+      closeTimer = setTimeout(() => {{
+        if (!profile.contains(document.activeElement) && !profile.matches(":hover")) profile.open = false;
+      }}, 200);
+    }});
+    profile.addEventListener("focusout", () => {{
+      if (keepOpen) return;
+      setTimeout(() => {{
+        if (!profile.contains(document.activeElement) && !profile.matches(":hover")) profile.open = false;
+      }}, 0);
+    }});
+    if (keepOpen) {{
+      document.addEventListener("pointerdown", event => {{
+        if (!profile.contains(event.target)) {{
+          profile.open = false;
+          openedByHover = false;
+        }}
+      }});
+    }}
+    profile.addEventListener("keydown", event => {{
+      if (event.key === "Escape") {{
+        event.stopPropagation();
+        profile.open = false;
+        profile.querySelector("summary").focus();
+      }}
+    }});
+  }};
+  document.querySelectorAll("[data-nav-profile], [data-nav-help]").forEach(setupHoverMenu);
+  const themeSelect = document.querySelector("[data-theme-select]");
+  if (themeSelect) {{
+    try {{
+      const saved = localStorage.getItem("dlcm-theme");
+      themeSelect.value = saved === "light" || saved === "dark" ? saved : "system";
+    }} catch (error) {{
+      themeSelect.value = "system";
+    }}
+    const systemTheme = matchMedia("(prefers-color-scheme: dark)");
+    themeSelect.addEventListener("change", () => {{
+      const choice = themeSelect.value;
+      document.documentElement.dataset.theme = choice === "system" ? (systemTheme.matches ? "dark" : "light") : choice;
+      try {{
+        if (choice === "system") localStorage.removeItem("dlcm-theme");
+        else localStorage.setItem("dlcm-theme", choice);
+      }} catch (error) {{
+        alert("Your theme changed, but this browser could not save the preference.");
+      }}
+    }});
+    systemTheme.addEventListener("change", () => {{
+      if (themeSelect.value === "system") document.documentElement.dataset.theme = systemTheme.matches ? "dark" : "light";
+    }});
+  }}
+  const updates = document.querySelector("[data-planner-revision]");
+  if (updates) {{
+    const checkUpdates = async () => {{
+      try {{
+        const response = await fetch(updates.dataset.url, {{cache: "no-store"}});
+        if (!response.ok) throw new Error("Update check failed");
+        const data = await response.json();
+        if (String(data.revision) !== updates.dataset.plannerRevision) {{
+          updates.hidden = false;
+          updates.querySelector("[data-update-message]").textContent =
+            "Planner data changed. Refresh to see the latest bookings; unsaved form changes will be lost.";
+        }}
+      }} catch (error) {{
+        updates.hidden = false;
+        updates.querySelector("[data-update-message]").textContent =
+          "Unable to check for planner updates. Check your connection and refresh when safe.";
+      }}
+    }};
+    setInterval(checkUpdates, 15000);
+  }}
+  const editForm = document.querySelector("[data-edit-heartbeat]");
+  if (editForm) {{
+    let submitting = false;
+    const csrf = editForm.querySelector('input[name="_csrf_token"]').value;
+    const editToken = editForm.querySelector('input[name="edit_token"]').value;
+    const notice = document.querySelector("[data-edit-notice]");
+    editForm.addEventListener("submit", () => {{ submitting = true; }});
+    const heartbeat = async () => {{
+      try {{
+        const response = await fetch(editForm.dataset.editHeartbeat, {{
+          method: "POST",
+          body: new URLSearchParams({{_csrf_token: csrf, edit_token: editToken}}),
+          cache: "no-store"
+        }});
+        if (!response.ok) throw new Error("Edit lease unavailable");
+      }} catch (error) {{
+        notice.hidden = false;
+        notice.textContent = "Could not renew your editing session. Copy any unsaved changes and reload before saving.";
+      }}
+    }};
+    setInterval(heartbeat, 30000);
+    window.addEventListener("pagehide", () => {{
+      if (!submitting) navigator.sendBeacon(editForm.dataset.editRelease, new URLSearchParams({{_csrf_token: csrf, edit_token: editToken}}));
+    }});
+  }}
+}});
 </script>
 </head>
-<body>
-<nav>{nav}<span style="color:#c5d3e0;margin-left:auto;">v{app_version}</span></nav>
+<body class="{body_class}">
+<nav>{nav}<span class="nav-version">v{app_version}</span></nav>
 <div class="container">
-<h1>{title}</h1>
+{heading}
 {log_strip}
 {body}
 </div>
@@ -470,10 +795,20 @@ def esc(value: str) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _filter_controls(label: str, placeholder: str) -> str:
+    return (
+        '<div class="section-filter" data-filter-controls hidden>'
+        f'<label>{esc(label)} <input type="search" placeholder="{esc(placeholder)}" autocomplete="off"></label>'
+        '<span class="section-filter-result" data-filter-result role="status"></span></div>'
+    )
+
+
+# Attribute actions on the shared Planner account to the name given at sign-in.
 def _current_actor() -> str:
     return session.get("display_name") or session.get("user", "unknown")
 
 
+# Keep vehicles in their existing section order; collect unassigned ones under Other vehicles.
 def _group_vehicles(vehicles: list[dict]) -> list[tuple[str, list[dict]]]:
     grouped: dict[str, list[dict]] = {}
     for vehicle in vehicles:
@@ -482,10 +817,10 @@ def _group_vehicles(vehicles: list[dict]) -> list[tuple[str, list[dict]]]:
     return list(grouped.items())
 
 
-def render_page(title: str, body: str) -> str:
+def render_page(title: str, body: str, *, show_heading: bool = True, dashboard: bool = False) -> str:
     """Wrap ``body`` (already-escaped HTML) in the shared page layout, with a strip
-    showing the most recent background-operation log entries (see log_event())."""
-    entries = recent_log_entries(5)
+    showing recent background-operation log entries to admins only."""
+    entries = recent_log_entries(5) if session.get("user") and session.get("role") == "admin" else []
     if entries:
         items = "".join(
             f'<li><span class="log-time">{esc(e["time"])}</span>{esc(e["message"])}</li>'
@@ -501,15 +836,37 @@ def render_page(title: str, body: str) -> str:
     if not user:
         nav = '<a href="' + url_for("login") + '">Sign in</a>'
     else:
+        help_contact = get_help_contact()
+        help_name = esc(help_contact) if help_contact else "Not configured"
         nav = (
             f'<a class="workspace-tab" href="{url_for("team_dashboard")}" '
             f'{"aria-current=page" if request.endpoint == "team_dashboard" and request.args.get("section", "home") == "home" else ""}>Home</a> '
         )
         nav += (
-            f'<form method="post" action="{url_for("logout")}" style="display:inline">'
+            f'<form class="nav-search" role="search" method="get" action="{url_for("navigation_search")}">'
+            '<input type="search" name="q" aria-label="Search app pages" placeholder="Search pages" required>'
+            '<button type="submit">Search</button></form>'
+            '<details class="nav-profile" data-nav-profile>'
+            '<summary aria-label="Profile">Profile</summary>'
+            f'<div class="nav-profile-panel"><strong>{esc(session.get("display_name", user))}</strong>'
+            + (f'<span class="nav-account">Account: {esc(user)}</span>' if session.get("display_name") and session["display_name"] != user else "")
+            + '<label class="nav-theme-label" for="nav-theme">Theme</label>'
+            '<select id="nav-theme" data-theme-select><option value="system">System</option>'
+            '<option value="light">Light</option><option value="dark">Dark</option></select>'
+            '<details class="nav-help" data-nav-help><summary>Help</summary>'
+            '<div class="nav-help-message">If the app is not working, contact your admin.'
+            f'<br>Admin: {help_name}</div></details>'
+            + f'<form method="post" action="{url_for("logout")}">'
             f'<input type="hidden" name="_csrf_token" value="{esc(session.get("csrf_token", ""))}">'
-            f'<button type="submit">Sign out ({esc(session.get("display_name", user))})</button></form>'
+            '<button type="submit">Sign out</button></form></div></details>'
         )
+    brand_destination = url_for("team_dashboard") if user else url_for("login")
+    brand_label = "DLCM Planning Hub home" if user else "DLCM Planning Hub sign in"
+    nav = (
+        f'<a class="nav-brand" href="{brand_destination}" aria-label="{brand_label}">'
+        f'<img src="{url_for("static", filename="app-logo.png")}" alt=""></a>'
+        + nav
+    )
     secured_body = re.sub(
         r"(<form\b(?=[^>]*\bmethod=['\"]?post\b)[^>]*>)",
         lambda match: match.group(1)
@@ -517,12 +874,27 @@ def render_page(title: str, body: str) -> str:
         body,
         flags=re.IGNORECASE,
     )
+    if hasattr(g, "planner_revision"):
+        secured_body = (
+            f'<div class="warn" role="status" hidden data-planner-revision="{g.planner_revision}" '
+            f'data-url="{url_for("planner_updates")}"><span data-update-message></span> '
+            '<a href="" onclick="return confirm(\'Refresh and discard any unsaved form changes?\')">Refresh page</a></div>'
+            + secured_body
+        )
     return PAGE.format(
         title=esc(title),
+        heading=f"<h1>{esc(title)}</h1>" if show_heading else "",
         body=secured_body,
         nav=nav,
         log_strip=log_strip,
         app_version=esc(APP_VERSION),
+        dashboard_head=(
+            f'<link rel="stylesheet" href="{url_for("static", filename="vendor/bootstrap/bootstrap-grid.min.css")}">'
+            f'<link rel="stylesheet" href="{url_for("static", filename="dashboard.css")}">'
+            if dashboard else ""
+        ),
+        body_class="dashboard-page" if dashboard else "",
+        theme_css_url=url_for("static", filename="theme.css"),
         index_url=url_for("index"),
         sprint_url=url_for("sprint_form"),
         refresh_url=url_for("refresh_form"),
@@ -535,10 +907,53 @@ def render_page(title: str, body: str) -> str:
     )
 
 
+@app.route("/search")
+def navigation_search() -> str:
+    """Search available app destinations, not vehicle or booking records."""
+    query = request.args.get("q", "").strip()
+    destinations = [
+        ("Home", url_for("team_dashboard"), "workspace"),
+        ("Testing / Bookings", url_for("team_dashboard", section="testing"), "submit book activity my bookings"),
+        ("Automation / Review bookings", url_for("team_dashboard", section="automation"), "approve reject jira ticket"),
+        ("Vehicles", url_for("vehicle_management"), "active inactive add edit vehicle"),
+        ("Activity History", url_for("team_dashboard", section="history"), "grid timeline calendar usage"),
+        ("Excel-style grid", url_for("team_dashboard", section="history", view="grid"), "activity history"),
+        ("Weekly timeline", url_for("team_dashboard", section="history", view="timeline"), "activity history"),
+        ("Calendar", url_for("team_dashboard", section="history", view="calendar"), "activity history"),
+    ]
+    if session.get("role") == "admin":
+        destinations.extend([
+            ("Admin", url_for("admin_dashboard"), "administration"),
+            ("Manage Users", url_for("admin_users"), "accounts"),
+            ("Access & Change Log", url_for("admin_audit"), "audit"),
+            ("Change Password", url_for("change_password"), "account"),
+            ("Email Notifications", url_for("admin_email_settings"), "mail"),
+            ("Help Contact", url_for("admin_help_settings"), "support administrator"),
+            ("Background Activity Log", url_for("log_view"), "recent log"),
+        ])
+    terms = query.casefold().split()
+    matches = [
+        (label, link) for label, link, keywords in destinations
+        if terms and all(term in f"{label} {keywords}".casefold() for term in terms)
+    ]
+    if not query:
+        content = "<p>Enter a page or section to search.</p>"
+    elif matches:
+        content = '<ul>' + "".join(
+            f'<li><a href="{esc(link)}">{esc(label)}</a></li>' for label, link in matches
+        ) + '</ul>'
+    else:
+        content = "<p>No matching pages or sections found.</p>"
+    return render_page("Search pages", f'<p>Results for: <strong>{esc(query)}</strong></p>{content}')
+
+
+# Preserve the username and show the error when a sign-in attempt fails.
 def _login_form(username: str = "", error: str = "") -> str:
     error_html = f'<p class="warn" role="alert">{esc(error)}</p>' if error else ""
+    next_path = request.args.get("next", "")
+    login_url = url_for("login", next=next_path) if next_path else url_for("login")
     return (
-        f'{error_html}<form class="card login-form" data-login-form method="post" action="{url_for("login")}">'
+        f'{error_html}<form class="card login-form" data-login-form method="post" action="{esc(login_url)}">'
         '<label for="login-username">Username</label>'
         f'<input id="login-username" type="text" name="username" value="{esc(username)}" '
         'autocomplete="username" required autofocus>'
@@ -552,6 +967,7 @@ def _login_form(username: str = "", error: str = "") -> str:
     )
 
 
+# Recheck account access on each request and require a session token for POST forms.
 @app.before_request
 def enforce_login_roles_and_csrf():
     if "csrf_token" not in session:
@@ -568,7 +984,7 @@ def enforce_login_roles_and_csrf():
 
     user_name = session.get("user")
     user = get_user(user_name) if user_name else None
-    if user is None or not user["active"]:
+    if user is None or not user["active"] or session.get("user_id") != user["id"]:
         session.pop("user", None)
         session.pop("role", None)
         session.pop("user_id", None)
@@ -594,10 +1010,15 @@ def enforce_login_roles_and_csrf():
 
     if endpoint.startswith("admin_") and user["role"] != "admin":
         abort(403)
-    if endpoint == "change_password" and user["role"] != "admin":
+    if endpoint in {"change_password", "log_view"} and user["role"] != "admin":
         abort(403)
     if user["role"] in ("planner", "automation") and endpoint not in TEAM_ENDPOINTS:
         abort(403)
+    if request.method == "GET" and endpoint in {
+        "team_dashboard", "campaign_planner", "my_bookings", "activity_history", "vehicle_history",
+        "booking_review", "vehicle_management", "edit_booking",
+    }:
+        g.planner_revision = planner_revision()
     return None
 
 
@@ -1466,6 +1887,7 @@ def repo_edit(filename: str) -> str:
     return render_page("Asset Vehicles", f'<p>Vehicle files are managed in Assets. <a href="{url_for("repo_list")}">View Assets</a>.</p>')
 
 
+# Render the shared booking table, with review and Jira actions in Automation mode.
 def _booking_table(bookings: list[dict], *, review: bool = False) -> str:
     rows = []
     try:
@@ -1507,9 +1929,19 @@ def _booking_table(bookings: list[dict], *, review: bool = False) -> str:
                     "I checked Jira and no issue was created.</label>"
                     '<button type="submit">Re-approve for retry</button></form>'
                 )
+        search_text = " ".join(
+            str(value or "") for value in (
+                booking["vehicle_label"], booking["vehicle_vin"], booking["activity"],
+                booking["period"], _booking_date_range_label(booking), booking["checklist_template"],
+                booking["status"].replace("_", " "), booking["jira_issue_key"], booking["created_by"],
+                PROGRESS_LABELS[_booking_progress(booking)]
+                if booking["status"] in PROGRESS_EDITABLE_STATUSES or booking["status"] == "historical"
+                else "After approval",
+            )
+        )
         rows.append(
-            "<tr>"
-            f"<td>{esc(booking['vehicle_label'])}</td>"
+            (f'<tr data-filter-row data-filter-text="{esc(search_text)}">' if review else "<tr>")
+            + f"<td>{esc(booking['vehicle_label'])}</td>"
             f"<td>{esc(booking['vehicle_vin'] or '—')}</td>"
             f"<td>{esc(booking['activity'])}</td>"
             f"<td>{esc(booking['period'])}</td>"
@@ -1533,6 +1965,7 @@ def _booking_table(bookings: list[dict], *, review: bool = False) -> str:
     )
 
 
+# Authenticate the account and send shared Planner users to the identity prompt.
 @app.route("/login", methods=["GET", "POST"])
 def login() -> str:
     if session.get("user"):
@@ -1595,6 +2028,7 @@ def login() -> str:
     return redirect(url_for("team_dashboard"))
 
 
+# Collect a self-reported name before recording actions under the shared account.
 @app.route("/identify", methods=["GET", "POST"])
 def identify_user() -> str:
     if session.get("role") != "planner" or not session.get("needs_identity"):
@@ -1630,20 +2064,24 @@ def identify_user() -> str:
     return redirect(url_for("team_dashboard"))
 
 
+# Record who signed out before clearing their session and returning to sign-in.
 @app.route("/logout", methods=["POST"])
 def logout() -> str:
     if session.get("user"):
         record_audit_event(_current_actor(), "Signed out")
+    if session.get("edit_token"):
+        release_user_edits(session["edit_token"])
     session.clear()
     return redirect(url_for("login"), code=303)
 
 
+# Let admins replace their own password, including after a required reset.
 @app.route("/change-password", methods=["GET", "POST"])
 def change_password() -> str:
     if request.method == "GET":
         return render_page(
             "Change password",
-            f"""<form method="post" action="{url_for('change_password')}">
+            f"""<form class="card admin-settings" method="post" action="{url_for('change_password')}">
               <label>Current password <input type="password" name="current_password" required></label>
               <label>New password <input type="password" name="new_password" minlength="12" required></label>
               <label>Confirm new password <input type="password" name="confirm_password" minlength="12" required></label>
@@ -1666,7 +2104,7 @@ def change_password() -> str:
         return render_page("Change password", f'<p class="warn">{esc(exc)}</p><p><a href="{url_for("change_password")}">Try again</a></p>'), 400
     session["must_change_password"] = False
     record_audit_event(_current_actor(), "Changed password")
-    return redirect(url_for("team_dashboard"))
+    return redirect(session.pop("next_after_login", "") or url_for("team_dashboard"))
 
 
 @app.route("/admin/users")
@@ -1685,46 +2123,66 @@ def admin_users() -> str:
             if user["active"]
             else '<span class="form-hint">Enable account to reset its password.</span>'
         )
+        rename_control = (
+            '<details class="admin-user-rename"><summary>Rename</summary>'
+            f'<form method="post" action="{url_for("admin_user_rename", user_id=user["id"])}">'
+            f'<input type="text" name="username" value="{esc(user["username"])}" '
+            f'aria-label="New username for {esc(user["username"])}" required>'
+            '<button type="submit">Save name</button></form></details>'
+            if user["id"] != session.get("user_id")
+            else '<span class="form-hint">Another admin can rename your account.</span>'
+        )
         rows.append(
-            f'<tr><td>{esc(user["username"])}</td><td>{esc(user["created_at"])}</td><td>'
+            f'<tr data-filter-row data-filter-text="{esc(user["username"])} {esc(user["role"])} {"active" if user["active"] else "inactive"}">'
+            f'<td>{esc(user["username"])}{rename_control}</td><td>{esc(user["created_at"])}</td><td>'
             f'<form method="post" action="{url_for("admin_user_access", user_id=user["id"])}">'
             f'<select name="role">{role_options}</select> '
             f'<label><input type="checkbox" name="active" value="1" {checked}> Active</label> '
-            '<button type="submit">Save access</button></form></td>'
+            f'<button type="submit">Save access</button></form></td>'
             f'<td>{reset_control}</td></tr>'
         )
     body = f"""
     <p>Only app admins can manage access or reset passwords. Users cannot change their own passwords. For shared team access, create one Planner account and share its password securely. Every Planner sign-in asks for the person’s name; that self-reported name is recorded with their activity.</p>
-    <form method="post" action="{url_for('admin_user_create')}">
+    <p>Renaming changes the sign-in username and ends existing sessions for that account. Past booking and audit names stay unchanged; bookings under an old name remain in Activity History but not under the new name in My Bookings. To remove an account's access without deleting its history, clear Active and select Save access.</p>
+    <form class="card admin-create-user" method="post" action="{url_for('admin_user_create')}">
+      <h3>Create user</h3>
       <label>Username <input type="text" name="username" required></label>
       <label>Role <select name="role"><option value="planner">Planner</option><option value="automation">Automation</option><option value="admin">Admin</option></select></label>
       <button type="submit">Create user</button>
     </form>
-    <h3>Current users</h3>
-    <table><tr><th>Username</th><th>Created</th><th>Role and access</th><th>Password</th></tr>{''.join(rows)}</table>
+    <section class="card admin-list" data-filter-panel>
+      <h3>Current users</h3>
+      {_filter_controls("Search users", "Username, role or access")}
+      <div class="table-wrap"><table><tr><th>Username</th><th>Created</th><th>Role and access</th><th>Password</th></tr>{''.join(rows)}</table></div>
+    </section>
+    <p><a href="{url_for('admin_dashboard')}">Back to admin</a></p>
     """
     return render_page("Manage users", body)
 
 
+# Show recorded actions from newest to oldest, including shared-account activity.
 @app.route("/admin/audit")
 def admin_audit() -> str:
     events = list_audit_events()
     rows = "".join(
-        f'<tr><td>{esc(event["created_at"])}</td><td>{esc(event["actor"])}</td>'
+        f'<tr data-filter-row><td>{esc(event["created_at"])}</td><td>{esc(event["actor"])}</td>'
         f'<td>{esc(event["action"])}</td><td>{esc(event["details"])}</td></tr>'
         for event in events
     )
     body = (
         '<p>Sign-ins, sign-outs, booking changes, vehicle edits, and ticket actions. '
         'Names from the shared Planner account are self-reported.</p>'
-        '<div class="table-wrap"><table><tr><th>Time</th><th>Person/account</th>'
-        f'<th>Action</th><th>Details</th></tr>{rows}</table></div>'
+        '<section class="card admin-list" data-filter-panel>'
+        + _filter_controls("Search log", "Person, action or details")
+        + '<div class="table-wrap"><table><tr><th>Time</th><th>Person/account</th>'
+        f'<th>Action</th><th>Details</th></tr>{rows}</table></div></section>'
         if rows
         else '<p class="form-hint">No access or change events have been recorded yet.</p>'
     )
-    return render_page("Access & Change Log", body)
+    return render_page("Access & Change Log", body + f'<p><a href="{url_for("admin_dashboard")}">Back to admin</a></p>')
 
 
+# Create a role-based account and show the generated password to the admin.
 @app.route("/admin/users/create", methods=["POST"])
 def admin_user_create() -> str:
     username = request.form.get("username", "")
@@ -1745,6 +2203,7 @@ def admin_user_create() -> str:
     return render_page("User created", body)
 
 
+# Save role and active-state changes and record who made them.
 @app.route("/admin/users/<int:user_id>/access", methods=["POST"])
 def admin_user_access(user_id: int) -> str:
     role = request.form.get("role", "")
@@ -1754,6 +2213,20 @@ def admin_user_access(user_id: int) -> str:
     except ValueError as exc:
         return render_page("Update access", f'<p class="warn">{esc(exc)}</p><p><a href="{url_for("admin_users")}">Back</a></p>'), 400
     record_audit_event(_current_actor(), "Updated user access", f"User ID {user_id}; role {role}; active {active}")
+    return redirect(url_for("admin_users"))
+
+
+@app.route("/admin/users/<int:user_id>/rename", methods=["POST"])
+def admin_user_rename(user_id: int) -> str:
+    if user_id == session.get("user_id"):
+        abort(400, description="Another admin must rename your account.")
+    try:
+        old_name = rename_user(user_id, request.form.get("username", ""))
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        return render_page("Rename user", f'<p class="warn">{esc(exc)}</p><p><a href="{url_for("admin_users")}">Back</a></p>'), 400
+    new_name = request.form.get("username", "").strip().lower()
+    if new_name != old_name:
+        record_audit_event(_current_actor(), "Renamed user account", f"User ID {user_id}; {old_name} to {new_name}")
     return redirect(url_for("admin_users"))
 
 
@@ -1790,24 +2263,48 @@ def campaign_planner() -> str:
     return team_dashboard("testing")
 
 
+# Show the booking form only when there are active vehicles to book.
 def _campaign_planner_section() -> str:
     vehicles = list_vehicles()
     if not vehicles:
         return (
             '<section class="team-section" id="submit-booking"><h2>Testing Team: Submit an activity</h2>'
-            '<div class="card"><p class="warn">No vehicles are configured yet. Add a vehicle below or run the workbook import.</p></div></section>'
+            f'<div class="card"><p class="warn">No active vehicles are available. <a href="{url_for("vehicle_management")}">Manage vehicles</a> or run the workbook import.</p></div></section>'
         )
     body = f"""
+    <div class="booking-header">
+      <div><p class="booking-eyebrow">VEHICLE TEST RESOURCES</p><h2>Submit/Book an activity</h2>
+      <p class="planner-intro">Plan a vehicle activity and send it for review.</p></div>
+      <a class="booking-shortcut" href="#my-bookings">View my bookings &darr;</a>
+    </div>
     <p class="planner-intro">Plan by week or dates. Enter at least one; dates take precedence when both are provided, and a date range may cross weeks. Submission saves it for review and does not create a Jira ticket.</p>
-    <form class="card planner-form" method="post" action="{url_for('submit_booking')}">
+    <p class="form-hint">Before booking, check the <a href="{url_for('vehicle_management')}">Vehicles section</a>
+    to confirm the vehicle is ready for testing and not blocked.</p>
+    <div class="booking-layout">
+    <form class="card planner-form booking-form" data-booking-form method="post" action="{url_for('submit_booking')}">
+      <div class="booking-form-heading wide"><span class="booking-step">01</span><div><h3>Activity details</h3><p>Choose your vehicle and planning dates.</p></div></div>
       {_booking_form_fields(vehicles)}
       {_notification_recipient_fields()}
       <button class="primary-action" type="submit">Submit booking for review</button>
     </form>
+    <aside class="card booking-preview" data-booking-preview aria-labelledby="booking-preview-title">
+      <p class="booking-eyebrow">YOUR RESERVATION</p><h3 id="booking-preview-title">Booking preview</h3>
+      <p class="booking-preview-intro">Updates as you complete the form.</p>
+      <noscript><p class="booking-preview-intro">Enable JavaScript to see the live preview.</p></noscript>
+      <dl>
+        <div><dt>Vehicle</dt><dd data-preview-vehicle>See form selection</dd></div>
+        <div><dt>Activity</dt><dd data-preview-activity>Add an activity</dd></div>
+        <div><dt>Planned dates</dt><dd data-preview-dates>Choose a week or dates</dd><dd class="booking-preview-hint" data-preview-date-hint></dd></div>
+        <div><dt>Next step</dt><dd>Submit for review</dd></div>
+      </dl>
+      <p class="booking-preview-footnote">Availability is checked when you submit. A Jira ticket is not created by this form.</p>
+    </aside>
+    </div>
     """
-    return f'<section class="team-section" id="submit-booking"><h2>Submit/Book an activity</h2>{body}</section>'
+    return f'<section class="team-section booking-section" id="submit-booking">{body}</section>'
 
 
+# Share fields between new bookings and edits, calculating the ISO-week preview on each render.
 def _booking_form_fields(vehicles: list[dict], booking: dict | None = None) -> str:
     booking = booking or {}
     selected_vehicle_id = booking.get("vehicle_id")
@@ -1842,7 +2339,7 @@ def _booking_form_fields(vehicles: list[dict], booking: dict | None = None) -> s
     current_week_preview = (
         f'<span class="current-week-preview">Current week: <strong>{current_period}</strong> '
         f'({week_start:%a %d %b} – {week_end:%a %d %b %Y}) '
-        f'<button type="button" class="link-button" onclick="this.form.period.value=\'{current_period}\'">'
+        f'<button type="button" class="link-button" onclick="useCurrentWeek(this, \'{current_period}\')">'
         'Use current week</button></span>'
     )
     return f"""
@@ -1872,11 +2369,17 @@ def my_bookings() -> str:
     return team_dashboard("testing")
 
 
+# Filter by the current actor so shared Planner users see their own submissions.
 def _my_bookings_section() -> str:
     bookings = list_bookings(created_by=_current_actor(), limit=500)
-    return f'<section class="team-section" id="my-bookings"><h2>My Bookings</h2>{_booking_table(bookings)}</section>'
+    return (
+        '<section class="team-section booking-my-bookings" id="my-bookings">'
+        '<p class="booking-eyebrow">YOUR ACTIVITY</p><h2>My Bookings</h2>'
+        f'<div class="card">{_booking_table(bookings)}</div></section>'
+    )
 
 
+# Pick the most common valid color for each activity name as its automatic default.
 def _activity_color_palette(bookings: list[dict]) -> dict[str, str]:
     palette_votes: dict[str, dict[str, int]] = {}
     for booking in bookings:
@@ -1891,6 +2394,7 @@ def _activity_color_palette(bookings: list[dict]) -> dict[str, str]:
     }
 
 
+# Prefer a valid explicit color; otherwise reuse the activity's palette color.
 def _booking_activity_color(booking: dict, activity_colors: dict[str, str]) -> str:
     color = booking.get("activity_color", "").strip().upper()
     if not re.fullmatch(r"#[0-9A-F]{6}", color):
@@ -1905,6 +2409,7 @@ def _history_color_swatch(booking: dict, activity_colors: dict[str, str]) -> str
     return f'<span class="history-color-swatch" style="background-color:{color}" title="Activity color {color}"></span>'
 
 
+# Keep imported history free of approval labels while formatting live statuses.
 def _activity_status_label(status: str) -> str:
     if status == "historical":
         return ""
@@ -1919,8 +2424,8 @@ def _history_status_badge(status: str) -> str:
 PROGRESS_LABELS = {"not_started": "Not started", "in_progress": "In progress", "closed": "Closed"}
 
 
+# Treat historical imports as finished and missing or invalid progress as not started.
 def _booking_progress(booking: dict) -> str:
-    # Activities imported as historical are already finished.
     if booking["status"] == "historical":
         return "closed"
     progress = booking.get("progress") or "not_started"
@@ -1939,10 +2444,12 @@ def _progress_badge(booking: dict) -> str:
     return ""
 
 
+# Fade closed app bookings without fading historical Excel records.
 def _is_closed_display(booking: dict) -> bool:
     return booking["status"] != "historical" and _booking_progress(booking) == "closed"
 
 
+# Render an editable progress selector only when the booking's review status allows it.
 def _progress_control(booking: dict, return_to: str) -> str:
     progress = _booking_progress(booking)
     if booking["status"] not in PROGRESS_EDITABLE_STATUSES:
@@ -1959,19 +2466,30 @@ def _progress_control(booking: dict, return_to: str) -> str:
     )
 
 
+# Lay out bookings in vehicle rows with day columns, spanning cells for multi-day work.
 def _activity_history_grid(
     dated_bookings: list[tuple[date, dict]],
     selected_year: str,
     activity_colors: dict[str, str],
 ) -> str:
-    if not dated_bookings:
+    vehicles = list_vehicles(active_only=False)
+    blocked_ranges = {
+        vehicle["id"]: bounds for vehicle in vehicles if (bounds := vehicle_block_bounds(vehicle))
+    }
+    if not dated_bookings and not blocked_ranges:
         return '<div class="card"><p>No activities were found for this selection.</p></div>'
 
     if selected_year == "all":
-        first_date = min(booking_date for booking_date, _ in dated_bookings)
+        first_date = min([
+            *(booking_date for booking_date, _ in dated_bookings),
+            *(start for start, _ in blocked_ranges.values()),
+        ])
         last_date = max(
-            _booking_activity_end_date(booking)
-            for _, booking in dated_bookings
+            [
+                *(_booking_activity_end_date(booking) for _, booking in dated_bookings),
+                *(end for _, end in blocked_ranges.values() if end != date.max),
+                date.today(),
+            ]
         )
         today = date.today()
         if today >= first_date:
@@ -1989,6 +2507,7 @@ def _activity_history_grid(
         for offset in range((last_day - first_day).days + 1)
     ]
 
+    # Choose contrasting text so an imported activity color remains readable.
     def activity_color_style(color: str) -> str:
         color = color.upper()
         if not re.fullmatch(r"#[0-9A-F]{6}", color):
@@ -1996,6 +2515,16 @@ def _activity_history_grid(
         red, green, blue = (int(color[index:index + 2], 16) for index in (1, 3, 5))
         text_color = "#000000" if (red * 299 + green * 587 + blue * 114) / 1000 >= 145 else "#FFFFFF"
         return f' style="background-color:{color};color:{text_color}"'
+
+    def unavailable_style(vehicle_id: int, start: date, end: date) -> str:
+        """Tint just the blocked portion of a cell without adding text or changing its span."""
+        bounds = blocked_ranges.get(vehicle_id)
+        if bounds is None or start > bounds[1] or bounds[0] > end:
+            return ""
+        length = (end - start).days + 1
+        left = (max(start, bounds[0]) - start).days / length * 100
+        width = ((min(end, bounds[1]) - max(start, bounds[0])).days + 1) / length * 100
+        return f' style="--unavailable-left:{left:.6f}%;--unavailable-width:{width:.6f}%"'
 
     bookings_by_vehicle: dict[int, list[tuple[date, dict]]] = {}
     vehicle_ids = set()
@@ -2012,6 +2541,10 @@ def _activity_history_grid(
         vehicle_id = booking["vehicle_id"]
         vehicle_ids.add(vehicle_id)
         bookings_by_vehicle.setdefault(vehicle_id, []).append((visible_start, visible_booking))
+    vehicle_ids.update(
+        vehicle_id for vehicle_id, (start, end) in blocked_ranges.items()
+        if start <= last_day and first_day <= end
+    )
 
     year_headers = []
     month_headers = []
@@ -2079,7 +2612,7 @@ def _activity_history_grid(
         )
 
     vehicle_rows = []
-    for group_name, group_vehicles in _group_vehicles(list_vehicles(active_only=False)):
+    for group_name, group_vehicles in _group_vehicles(vehicles):
         visible_vehicles = [vehicle for vehicle in group_vehicles if vehicle["id"] in vehicle_ids]
         if not visible_vehicles:
             continue
@@ -2090,7 +2623,7 @@ def _activity_history_grid(
             lanes: list[list[tuple[date, dict]]] = []
             lane_ends: list[date] = []
             entries = sorted(
-                bookings_by_vehicle[vehicle["id"]],
+                bookings_by_vehicle.get(vehicle["id"], []),
                 key=lambda entry: (entry[0], _booking_activity_end_date(entry[1])),
             )
             for entry in entries:
@@ -2106,11 +2639,11 @@ def _activity_history_grid(
                 lanes[lane_index].append(entry)
                 lane_ends[lane_index] = end_date
 
-            for lane_index, lane in enumerate(lanes):
+            for lane_index, lane in enumerate(lanes or [[]]):
                 cells = []
                 if lane_index == 0:
                     cells.append(
-                        f'<td class="grid-vehicle-col" rowspan="{len(lanes)}">'
+                        f'<td class="grid-vehicle-col" rowspan="{len(lanes) or 1}">'
                         f'<a href="{url_for("vehicle_history", vehicle_id=vehicle["id"])}">'
                         f'{esc(vehicle["label"])}</a><span>VIN: {esc(vehicle["vin"] or "Not recorded")}</span></td>'
                     )
@@ -2126,6 +2659,9 @@ def _activity_history_grid(
                     booking = entries_by_date.get(day)
                     if booking is None:
                         cell_class = ["grid-day-cell"]
+                        shade = unavailable_style(vehicle["id"], day, day)
+                        if shade:
+                            cell_class.append("grid-unavailable")
                         if day.weekday() >= 5:
                             cell_class.append("grid-weekend")
                         if (iso.year, iso.week) == current_week:
@@ -2134,7 +2670,8 @@ def _activity_history_grid(
                             cell_class.append("grid-month-end")
                         if day == date.today():
                             cell_class.append("grid-today")
-                        cells.append(f'<td class="{" ".join(cell_class)}" aria-label="No activity"></td>')
+                        accessibility_label = "Unavailable" if shade else "No activity"
+                        cells.append(f'<td class="{" ".join(cell_class)}"{shade} aria-label="{accessibility_label}"></td>')
                         day_index += 1
                         continue
 
@@ -2156,6 +2693,9 @@ def _activity_history_grid(
                         f'{esc(activity)}{status_markup}{progress_markup}{description_markup}</span>'
                     )
                     cell_class = ["grid-day-cell", "grid-filled"]
+                    shade = unavailable_style(vehicle["id"], day, span_end)
+                    if shade:
+                        cell_class.append("grid-unavailable")
                     if day.weekday() >= 5:
                         cell_class.append("grid-weekend")
                     if (iso.year, iso.week) == current_week:
@@ -2165,7 +2705,7 @@ def _activity_history_grid(
                     if day == date.today():
                         cell_class.append("grid-today")
                     cells.append(
-                        f'<td colspan="{max_span}" class="{" ".join(cell_class)}" aria-label="Activity from '
+                        f'<td colspan="{max_span}" class="{" ".join(cell_class)}"{shade} aria-label="Activity from '
                         f'{day:%d %B %Y} through {span_end:%d %B %Y}, KW{iso.week:02d}-{iso.year}">{label}</td>'
                     )
                     day_index += max_span
@@ -2189,34 +2729,18 @@ def _activity_history_grid(
     )
 
 
+# Prefer an explicit start date; use Monday for a booking entered by ISO week.
 def _booking_activity_date(booking: dict) -> date | None:
-    planned_date = booking["planned_date"].strip()
-    if planned_date:
-        return date.fromisoformat(planned_date)
-    match = re.fullmatch(r"KW(\d{1,2})(?:-(\d{4}))?", booking["period"].strip().upper())
-    if not match:
-        return None
-    week = int(match.group(1))
-    year = int(match.group(2)) if match.group(2) else date.today().isocalendar().year
-    try:
-        return date.fromisocalendar(year, week, 1)
-    except ValueError:
-        return None
+    bounds = booking_date_bounds(booking)
+    return bounds[0] if bounds else None
 
 
+# Resolve the inclusive end date: explicit end, Friday for a week, or the start day.
 def _booking_activity_end_date(booking: dict) -> date:
-    start_date = _booking_activity_date(booking)
-    if start_date is None:
+    bounds = booking_date_bounds(booking)
+    if bounds is None:
         raise ValueError("A booking end date requires a valid start date.")
-    raw_end_date = booking.get("planned_end_date", "").strip()
-    if not raw_end_date:
-        if not booking["planned_date"].strip():
-            return start_date + timedelta(days=4)
-        return start_date
-    end_date = date.fromisoformat(raw_end_date)
-    if end_date < start_date:
-        raise ValueError("A booking end date cannot be before its start date.")
-    return end_date
+    return bounds[1]
 
 
 def _booking_date_range_label(booking: dict) -> str:
@@ -2229,6 +2753,21 @@ def _booking_date_range_label(booking: dict) -> str:
     return start_date.isoformat()
 
 
+# Distinguish the app booker from a vehicle-sheet recorder; never infer a missing Excel author.
+def _calendar_activity_author(booking: dict) -> str:
+    source = booking.get("created_by", "")
+    description = booking.get("description", "").strip()
+    if source == "excel-detail-import":
+        match = re.search(r"(?:^|\n)Recorded by:\s*([^\r\n]+)", description, re.IGNORECASE)
+        if match and match.group(1).strip():
+            return f"Recorded by: {esc(match.group(1).strip())}"
+        return "Recorded by: Not provided in Excel"
+    if source.startswith("excel"):
+        return "Recorded by: Not provided in Excel"
+    return f"Booked by: {esc(source or 'Unknown')}"
+
+
+# Render month and week calendars using the same inclusive booking spans.
 def _activity_history_calendar(
     dated_bookings: list[tuple[date, dict]],
     selected_year: str,
@@ -2249,6 +2788,7 @@ def _activity_history_calendar(
     if selected_year != "all" and month_start.year != int(selected_year):
         abort(400, description="Choose a month within the selected year.")
 
+    # Let weeks that cross New Year appear in either year they overlap.
     def in_selected_year(start: date, end: date) -> bool:
         return selected_year == "all" or start.year <= int(selected_year) <= end.year
 
@@ -2289,6 +2829,7 @@ def _activity_history_calendar(
             bookings_by_day.setdefault(day, []).append(booking)
             day += timedelta(days=1)
 
+    # Use the activity's fill color with contrasting text on the event.
     def event_style(booking: dict) -> str:
         color = _booking_activity_color(booking, activity_colors)
         if not color:
@@ -2324,9 +2865,7 @@ def _activity_history_calendar(
                 date_label = start_date.strftime("%d %b")
                 if end_date > start_date:
                     date_label += f" – {end_date:%d %b}"
-                booked_by = booking.get("created_by", "")
-                # Excel imports have no known booker, so the calendar omits it for them.
-                meta = [] if booked_by.startswith("excel") else [f"Booked by: {esc(booked_by or 'Unknown')}"]
+                meta = [_calendar_activity_author(booking)]
                 for badge in (_history_status_badge(booking["status"]), _progress_badge(booking)):
                     if badge:
                         meta.append(badge)
@@ -2346,6 +2885,7 @@ def _activity_history_calendar(
             day += timedelta(days=1)
         rows.append("<tr>" + "".join(cells) + "</tr>")
 
+    # Keep date navigation in the fleet or per-vehicle calendar that opened it.
     def calendar_url(calendar_scope: str, month: str, week: str = "") -> str:
         params = {"view": "calendar", "month": month}
         if calendar_scope == "week":
@@ -2404,8 +2944,8 @@ def _activity_history_calendar(
         calendar_title = f"{month_name[month_start.month]} {month_start.year}"
     scope_tabs = (
         '<div class="activity-calendar-scope" aria-label="Calendar range">'
-        f'<a class="{"selected" if scope == "month" else ""}" href="{calendar_url("month", current_month_value)}">Month</a>'
-        f'<a class="{"selected" if scope == "week" else ""}" href="{calendar_url("week", current_month_value, current_week_value)}">Week</a>'
+        f'<a class="{"selected" if scope == "month" else ""}"{" aria-current=page" if scope == "month" else ""} href="{calendar_url("month", current_month_value)}">Month</a>'
+        f'<a class="{"selected" if scope == "week" else ""}"{" aria-current=page" if scope == "week" else ""} href="{calendar_url("week", current_month_value, current_week_value)}">Week</a>'
         "</div>"
     )
     calendar_action = (
@@ -2442,6 +2982,10 @@ def _activity_history_calendar(
             '<label class="sr-only" for="activity-calendar-month">Choose month</label>'
             f'<input id="activity-calendar-month" type="month" name="month" value="{current_month_value}"{month_constraints}>'
         )
+    visible_count = sum(
+        1 for start, booking in dated_bookings
+        if start <= calendar_end and _booking_activity_end_date(booking) >= calendar_start
+    )
     return (
         f'<section class="activity-calendar activity-calendar-{scope}" aria-label="Vehicle activity calendar">'
         '<div class="activity-calendar-nav">'
@@ -2454,6 +2998,7 @@ def _activity_history_calendar(
         + year_field
         + picker
         + '<button type="submit">Go</button></form></div>'
+        + f'<p class="calendar-caption">{visible_count} activities in displayed dates. <span>Scroll sideways to see the full calendar on smaller screens.</span></p>'
         '<table class="activity-calendar-table"><thead><tr>'
         + day_names
         + '</tr></thead><tbody>'
@@ -2467,6 +3012,7 @@ def activity_history() -> str:
     return team_dashboard("history")
 
 
+# Build fleet usage before filtering the grid, timeline, or calendar by year.
 def _activity_history_section() -> str:
     bookings = [booking for booking in list_bookings(limit=5000) if booking["status"] != "rejected"]
     activity_colors = _activity_color_palette(bookings)
@@ -2475,15 +3021,19 @@ def _activity_history_section() -> str:
         booking_date = _booking_activity_date(booking)
         if booking_date is not None:
             dated_bookings.append((booking_date, booking))
-    vehicle_usage = _vehicle_usage_section(list_vehicles(active_only=False), dated_bookings, date.today())
-    years = sorted(
-        {
+    vehicles = list_vehicles(active_only=False)
+    vehicle_usage = _vehicle_usage_section(vehicles, dated_bookings, date.today())
+    available_years = {
             year
             for booking_date, booking in dated_bookings
             for year in range(booking_date.year, _booking_activity_end_date(booking).year + 1)
-        },
-        reverse=True,
-    )
+    }
+    for vehicle in vehicles:
+        bounds = vehicle_block_bounds(vehicle)
+        if bounds:
+            end_year = bounds[1].year if bounds[1] != date.max else date.today().year
+            available_years.update(range(bounds[0].year, end_year + 1))
+    years = sorted(available_years, reverse=True)
     default_year = str(date.today().year)
     if default_year not in {str(year) for year in years}:
         default_year = str(years[0]) if years else "all"
@@ -2562,9 +3112,9 @@ def _activity_history_section() -> str:
             selected_month = f"{year_number:04d}-{default_month:02d}"
     view_tabs = (
         '<div class="view-tabs">'
-        f'<a class="{"selected" if selected_view == "grid" else ""}" href="{url_for("team_dashboard", section="history", year=selected_year, view="grid")}">Excel-style grid</a>'
-        f'<a class="{"selected" if selected_view == "timeline" else ""}" href="{url_for("team_dashboard", section="history", year=selected_year, view="timeline")}">Weekly timeline</a>'
-        f'<a class="{"selected" if selected_view == "calendar" else ""}" href="{url_for("team_dashboard", section="history", year=selected_year, view="calendar", month=selected_month)}">Calendar</a>'
+        f'<a class="{"selected" if selected_view == "grid" else ""}"{" aria-current=page" if selected_view == "grid" else ""} href="{url_for("team_dashboard", section="history", year=selected_year, view="grid")}">Excel-style grid</a>'
+        f'<a class="{"selected" if selected_view == "timeline" else ""}"{" aria-current=page" if selected_view == "timeline" else ""} href="{url_for("team_dashboard", section="history", year=selected_year, view="timeline")}">Weekly timeline</a>'
+        f'<a class="{"selected" if selected_view == "calendar" else ""}"{" aria-current=page" if selected_view == "calendar" else ""} href="{url_for("team_dashboard", section="history", year=selected_year, view="calendar", month=selected_month)}">Calendar</a>'
         "</div>"
     )
     if selected_view == "grid":
@@ -2590,7 +3140,7 @@ def _activity_history_section() -> str:
         '<p class="planner-intro">New bookings appear here while pending and update as they are reviewed. Rejected bookings are excluded. '
         'In the Excel-style grid, colored cells mark weeks with activities.</p>'
         + vehicle_usage
-        + '<form class="card" method="get" action="'
+        +                 '<form class="card" method="get" action="'
         + url_for("team_dashboard")
         + '"><label for="history-year">Filter by year</label>'
         + '<input type="hidden" name="section" value="history">'
@@ -2601,9 +3151,14 @@ def _activity_history_section() -> str:
         + view_tabs
         + history_content
     )
-    return f'<section class="team-section" id="activity-history"><h2>Vehicle Activity History</h2>{body}</section>'
+    return (
+        '<section class="team-section section-page" id="activity-history">'
+        '<p class="booking-eyebrow">FLEET INSIGHTS</p><h2>Vehicle Activity History</h2>'
+        f'{body}</section>'
+    )
 
 
+# Group vehicles by days since their latest recorded activity, ignoring future days.
 def _vehicle_usage_section(
     vehicles: list[dict],
     dated_bookings: list[tuple[date, dict]],
@@ -2668,6 +3223,7 @@ def _vehicle_usage_section(
     )
 
 
+# Show one vehicle's details and non-rejected activities in a timeline or calendar.
 @app.route("/planner/history/vehicle/<int:vehicle_id>")
 def vehicle_history(vehicle_id: int) -> str:
     vehicle = get_vehicle(vehicle_id)
@@ -2757,7 +3313,7 @@ def vehicle_history(vehicle_id: int) -> str:
     body = (
         f'<p class="planner-intro">Excel history and bookings for {esc(vehicle["label"])}, '
         f'shown by week with their current status.</p>'
-        f'<div class="card"><h3>Vehicle details</h3><div class="vehicle-details">{details}</div></div>'
+        + f'<div class="card"><h3>Vehicle details</h3><div class="vehicle-details">{details}</div></div>'
         f'<h3>Activity history ({len(dated_bookings)} activities)</h3>'
         + view_tabs
         + vehicle_history_content
@@ -2766,6 +3322,7 @@ def vehicle_history(vehicle_id: int) -> str:
     return render_page(f"Vehicle History — {vehicle['label']}", body)
 
 
+# Validate booking dates and colors, then identify weekend dates needing confirmation.
 def _parse_booking_form() -> tuple[dict, list[date]]:
     activity_color = request.form.get("activity_color", "").strip()
     if activity_color == "custom":
@@ -2827,26 +3384,34 @@ def _parse_booking_form() -> tuple[dict, list[date]]:
     return values, weekend_dates
 
 
+# Carry the form values and selected approvers through the weekend confirmation step.
 def _weekend_confirmation_page(
     values: dict, weekend_dates: list[date], action: str, cancel_url: str, verb: str,
-    notify_to: tuple[str, ...] = (),
+    notify_to: tuple[str, ...] = (), editing_booking_id: int | None = None,
 ) -> str:
     hidden_fields = "".join(
         f'<input type="hidden" name="{name}" value="{esc(value)}">'
         for name, value in values.items()
     ) + "".join(f'<input type="hidden" name="notify_to" value="{esc(address)}">' for address in notify_to)
     weekend_names = ", ".join(f'{day:%A, %d %B %Y}' for day in weekend_dates)
+    edit_attributes = (
+        f' data-edit-heartbeat="{url_for("booking_edit_heartbeat", booking_id=editing_booking_id)}"'
+        f' data-edit-release="{url_for("booking_edit_release", booking_id=editing_booking_id)}"'
+        if editing_booking_id is not None else ""
+    )
     return render_page(
         "Confirm weekend booking",
         '<div class="card"><p class="warn">This activity includes weekend date(s): '
         f'{weekend_names}. Weekend activities are included in the Excel-style calendar. '
         f'Do you want to {verb} this booking?</p>'
-        f'<form method="post" action="{action}">{hidden_fields}'
+        '<p class="warn" hidden data-edit-notice role="alert"></p>'
+        f'<form method="post" action="{action}"{edit_attributes}>{hidden_fields}'
         '<button type="submit" name="confirm_weekend" value="1">Confirm weekend booking</button> '
         f'<a class="button" href="{cancel_url}">Cancel</a></form></div>',
     )
 
 
+# Hide booking email controls when notifications are disabled or unconfigured.
 def _optional_mail_settings():
     try:
         settings = load_mail_settings()
@@ -2855,6 +3420,7 @@ def _optional_mail_settings():
     return settings if settings.enabled else None
 
 
+# Require at least one configured approver when email is enabled; deduplicate selections.
 def _selected_notification_recipients() -> tuple[str, ...]:
     settings = _optional_mail_settings()
     if settings is None:
@@ -2872,6 +3438,7 @@ def _selected_notification_recipients() -> tuple[str, ...]:
     return tuple(selected)
 
 
+# Offer configured approvers as a dropdown and preselect the only option if there is one.
 def _notification_recipient_fields() -> str:
     settings = _optional_mail_settings()
     if settings is None:
@@ -2892,6 +3459,7 @@ def _notification_recipient_fields() -> str:
     )
 
 
+# Save a pending booking and notify approvers without creating a Jira ticket.
 @app.route("/planner/bookings/create", methods=["POST"])
 def submit_booking() -> str:
     try:
@@ -2913,6 +3481,12 @@ def submit_booking() -> str:
             planned_end_date=values["planned_end_date"],
             activity_color=values["activity_color"],
         )
+    except BookingConflict as exc:
+        return render_page(
+            "Vehicle already booked",
+            f'<p class="warn">{esc(exc)} Use your browser’s Back button to choose another vehicle or date.</p>'
+            f'<p><a href="{url_for("activity_history")}">View activity history</a></p>',
+        ), 409
     except (ValueError, sqlite3.IntegrityError) as exc:
         return render_page("Booking not submitted", f'<p class="warn">{esc(exc)}</p><p><a href="{url_for("campaign_planner")}">Back</a></p>'), 400
     actor = _current_actor()
@@ -2932,10 +3506,12 @@ def submit_booking() -> str:
     return redirect(url_for("team_dashboard", section="testing", _anchor="my-bookings"))
 
 
+# Build email links with the configured host, falling back to the current request.
 def _app_url(path: str, base_url: str) -> str:
     return (base_url or request.url_root.rstrip("/")) + path
 
 
+# Prepare the message during the request, then deliver it in the background outside tests.
 def _notify_booking_submitted(booking_id: int, recipients: tuple[str, ...]) -> None:
     if not recipients:
         return
@@ -2948,7 +3524,9 @@ def _notify_booking_submitted(booking_id: int, recipients: tuple[str, ...]) -> N
             return
         booking["date_label"] = _booking_date_range_label(booking)
         message = build_booking_submitted_email(
-            settings, booking, _app_url(url_for("booking_review"), settings.app_base_url), recipients
+            settings, booking, _app_url(url_for("booking_review"), settings.app_base_url), recipients,
+            approve_url=_app_url(url_for("email_booking_review", booking_id=booking_id, decision="approve"), settings.app_base_url),
+            reject_url=_app_url(url_for("email_booking_review", booking_id=booking_id, decision="reject"), settings.app_base_url),
         )
     except Exception as exc:
         log_event(f"Booking #{booking_id} notification not prepared ({type(exc).__name__}: {exc}).", "error")
@@ -2967,6 +3545,36 @@ def _notify_booking_submitted(booking_id: int, recipients: tuple[str, ...]) -> N
         threading.Thread(target=deliver, name=f"booking-{booking_id}-email", daemon=True).start()
 
 
+# Edit pending or approved bookings that have no Jira ticket, keeping their review status.
+@app.route("/planner/updates")
+def planner_updates():
+    response = jsonify(revision=planner_revision())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/planner/bookings/<int:booking_id>/edit/heartbeat", methods=["POST"])
+def booking_edit_heartbeat(booking_id: int):
+    token = request.form.get("edit_token", "")
+    if not token or not hmac.compare_digest(token, session.get("edit_token", "")):
+        return jsonify(error="No active editing session."), 409
+    try:
+        holder = acquire_booking_edit(booking_id, token, _current_actor())
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 409
+    if holder is not None:
+        return jsonify(error=f"{holder} is editing this booking."), 409
+    return jsonify(ok=True)
+
+
+@app.route("/planner/bookings/<int:booking_id>/edit/release", methods=["POST"])
+def booking_edit_release(booking_id: int):
+    token = request.form.get("edit_token", "")
+    if token and hmac.compare_digest(token, session.get("edit_token", "")):
+        release_booking_edit(booking_id, token)
+    return "", 204
+
+
 @app.route("/planner/bookings/<int:booking_id>/edit", methods=["GET", "POST"])
 def edit_booking(booking_id: int) -> str:
     booking = get_booking(booking_id)
@@ -2980,21 +3588,47 @@ def edit_booking(booking_id: int) -> str:
             f'<p><a href="{back_url}">Back to review</a></p>',
         ), 409
     if request.method == "GET":
+        if session.get("edit_token"):
+            release_user_edits(session["edit_token"])
+        token = secrets.token_urlsafe(32)
+        try:
+            holder = acquire_booking_edit(booking_id, token, _current_actor())
+        except ValueError as exc:
+            return render_page("Booking cannot be edited", f'<p class="warn">{esc(exc)}</p><p><a href="{back_url}">Back to review</a></p>'), 409
+        if holder is not None:
+            return render_page(
+                "Booking is being edited",
+                f'<p class="warn">{esc(holder)} is currently editing this booking. '
+                f'Try again after they finish or their editing session expires.</p><p><a href="{back_url}">Back to review</a></p>',
+            ), 409
+        session["edit_token"] = token
         return render_page(
             f"Edit booking #{booking_id}",
             f'<p class="planner-intro">Submitted by {esc(booking["created_by"])}. Status: '
             f'{esc(booking["status"].title())}. Saving keeps the current review status.</p>'
-            f'<form class="card planner-form" method="post" action="{url_for("edit_booking", booking_id=booking_id)}">'
+            '<p class="form-hint">You are editing this booking. Your editing session expires after two minutes without updates.</p>'
+            '<p class="warn" hidden data-edit-notice role="alert"></p>'
+            f'<form class="card planner-form" method="post" action="{url_for("edit_booking", booking_id=booking_id)}" '
+            f'data-edit-heartbeat="{url_for("booking_edit_heartbeat", booking_id=booking_id)}" '
+            f'data-edit-release="{url_for("booking_edit_release", booking_id=booking_id)}">'
+            f'<input type="hidden" name="expected_revision" value="{booking["revision"]}">'
+            f'<input type="hidden" name="edit_token" value="{esc(token)}">'
             + _booking_form_fields(list_vehicles(), booking)
             + '<button class="primary-action" type="submit">Save booking changes</button></form>'
             f'<p><a href="{back_url}">Back to review</a></p>',
         )
     try:
+        raw_revision = request.form.get("expected_revision", "")
+        token = request.form.get("edit_token", "")
+        if not raw_revision.isdecimal() or not token or not hmac.compare_digest(token, session.get("edit_token", "")):
+            raise BookingChanged("Open the edit page before saving this booking.")
+        expected_revision = int(raw_revision)
         values, weekend_dates = _parse_booking_form()
         if weekend_dates and request.form.get("confirm_weekend") != "1":
             return _weekend_confirmation_page(
-                values, weekend_dates, url_for("edit_booking", booking_id=booking_id),
+                {**values, "expected_revision": raw_revision, "edit_token": token}, weekend_dates, url_for("edit_booking", booking_id=booking_id),
                 url_for("edit_booking", booking_id=booking_id), "save",
+                editing_booking_id=booking_id,
             )
         changed = update_booking(
             booking_id,
@@ -3005,12 +3639,21 @@ def edit_booking(booking_id: int) -> str:
             values["description"],
             planned_end_date=values["planned_end_date"],
             activity_color=values["activity_color"],
+            expected_revision=expected_revision,
+            edit_token=token,
         )
+    except (BookingChanged, BookingConflict) as exc:
+        return render_page(
+            "Booking not updated",
+            f'<p class="warn">{esc(exc)} Use your browser’s Back button to copy your unsaved changes before reloading.</p>'
+            f'<p><a href="{url_for("edit_booking", booking_id=booking_id)}">Reload booking</a></p>',
+        ), 409
     except (ValueError, sqlite3.IntegrityError) as exc:
         return render_page(
             "Booking not updated",
             f'<p class="warn">{esc(exc)}</p><p><a href="{url_for("edit_booking", booking_id=booking_id)}">Back</a></p>',
         ), 400
+    release_booking_edit(booking_id, session["edit_token"])
     actor = _current_actor()
     if changed:
         labels = {
@@ -3034,14 +3677,69 @@ def booking_review() -> str:
     return team_dashboard("automation")
 
 
+@app.route("/planner/bookings/<int:booking_id>/email-review/<decision>", methods=["GET", "POST"])
+def email_booking_review(booking_id: int, decision: str) -> str:
+    if decision not in ("approve", "reject"):
+        abort(404)
+    booking = get_booking(booking_id)
+    if booking is None:
+        abort(404)
+    back = f'<p><a href="{url_for("booking_review")}">Open review queue</a></p>'
+    if booking["status"] != "pending" or booking["jira_issue_key"]:
+        return render_page(
+            "Booking already reviewed",
+            '<p class="warn">This booking is no longer pending. No decision was made.</p>' + back,
+        ), 409
+    if decision == "approve":
+        if request.method == "POST":
+            return render_page(
+                "Preview Jira ticket",
+                '<p class="warn">The approval process has changed. Open the ticket preview before confirming.</p>'
+                f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, approval=1)}">Preview Jira ticket</a></p>{back}',
+            ), 409
+        return redirect(url_for("create_booking_ticket", booking_id=booking_id, approval=1))
+    if request.method == "POST":
+        revision = request.form.get("revision", "")
+        if not revision.isascii() or not revision.isdecimal() or len(revision) > 18:
+            abort(400, description="A valid booking revision is required.")
+        status = "rejected"
+        try:
+            review_booking(booking_id, status, _current_actor(), expected_revision=int(revision))
+        except ValueError as exc:
+            return render_page(
+                "Booking changed",
+                f'<p class="warn">{esc(exc)} Reload the email link to review the latest details.</p>{back}',
+            ), 409
+        record_audit_event(_current_actor(), f"Booking {status}", f"Booking #{booking_id}")
+        log_event(f"Booking #{booking_id} {status} by {_current_actor()}.")
+        return render_page("Booking reviewed", f'<p class="msg">Booking #{booking_id} {status}.</p>{back}')
+
+    action = "Approve" if decision == "approve" else "Reject"
+    body = (
+        f'<p>Review the current details before you {decision} this booking.</p>'
+        f'<div class="card"><p><strong>Booking:</strong> #{booking_id}<br>'
+        f'<strong>Vehicle:</strong> {esc(booking["vehicle_label"])}<br>'
+        f'<strong>VIN:</strong> {esc(booking["vehicle_vin"] or "Not recorded")}<br>'
+        f'<strong>Activity:</strong> {esc(booking["activity"])}<br>'
+        f'<strong>Week:</strong> {esc(booking["period"] or "Not specified")}<br>'
+        f'<strong>Dates:</strong> {esc(_booking_date_range_label(booking))}<br>'
+        f'<strong>Submitted by:</strong> {esc(booking["created_by"])}</p>'
+        f'<p class="vehicle-comment-text"><strong>Notes:</strong> {esc(booking["description"] or "None")}</p>'
+        f'<form method="post" action="{url_for("email_booking_review", booking_id=booking_id, decision=decision)}">'
+        f'<input type="hidden" name="revision" value="{booking["revision"]}">'
+        f'<button type="submit">{action} booking</button></form></div>{back}'
+        '<p>Rejecting does not create a Jira ticket.</p>'
+    )
+    return render_page(f"{action} booking", body)
+
+
+# Show new bookings by default, with separate filters for reviewed bookings.
 def _booking_review_section() -> str:
     requested_status = request.args.get("status", "actionable")
-    statuses = ("pending", "approved", "creating", "creation_error")
+    if requested_status == "pending":
+        requested_status = "actionable"
     if requested_status == "actionable":
-        bookings = [
-            booking for booking in list_bookings(statuses=statuses, limit=500)
-            if _booking_progress(booking) != "closed"
-        ]
+        bookings = list_bookings(status="pending", limit=500)
     elif requested_status == "all":
         bookings = list_bookings(limit=1000)
     elif requested_status in ("pending", "approved", "rejected", "historical", "creating", "created", "creation_error"):
@@ -3049,22 +3747,30 @@ def _booking_review_section() -> str:
     else:
         abort(400, description="Unknown booking status filter.")
     filters = "".join(
-        f'<a href="{url_for("team_dashboard", section="automation", status=key)}">{label}</a>'
+        f'<a class="{"selected" if key == requested_status else ""}"'
+        f'{" aria-current=page" if key == requested_status else ""}'
+        f' href="{url_for("team_dashboard", section="automation", status=key)}">{label}</a>'
         for key, label in (
-            ("actionable", "Actionable"), ("pending", "Pending"), ("approved", "Approved"),
-            ("created", "Created"), ("rejected", "Rejected"), ("historical", "Historical"),
+            ("actionable", "Actionable"), ("approved", "Approved"),
+            ("rejected", "Rejected"), ("historical", "Historical"),
             ("all", "All"),
         )
     )
     return (
-        '<section class="team-section" id="review-bookings"><h2>Automation Team: Review bookings and Create Jira tickets</h2>'
+        '<section class="team-section section-page" id="review-bookings">'
+        '<p class="booking-eyebrow">BOOKING WORKFLOW</p><h2>Automation Team: Review bookings and Create Jira tickets</h2>'
         f'<p class="planner-intro">Review weekly submissions. Approval does not create a Jira ticket; ticket creation requires a separate preview and confirmation.</p>'
+        '<p class="form-hint">Actionable shows new bookings awaiting review. Approved and Rejected show the review decision. All also includes Jira creation results and errors.</p>'
         f'<div class="review-filters" aria-label="Filter bookings">{filters}</div>'
+        '<div class="card review-panel" data-filter-panel>'
+        f'<div class="section-panel-heading"><h3>Bookings for review</h3><span>{len(bookings)} loaded</span></div>'
+        + _filter_controls("Search these bookings", "Vehicle, activity, person or status")
         + _booking_table(bookings, review=True)
-        + "</section>"
+        + "</div></section>"
     )
 
 
+# Record a review decision separately from progress changes and ticket creation.
 @app.route("/planner/bookings/<int:booking_id>/review", methods=["POST"])
 def review_booking_action(booking_id: int) -> str:
     decision = request.form.get("decision", "")
@@ -3077,9 +3783,12 @@ def review_booking_action(booking_id: int) -> str:
     actor = _current_actor()
     record_audit_event(actor, f"Booking {decision}", f"Booking #{booking_id}")
     log_event(f"Booking #{booking_id} {decision} by {actor}.")
+    if decision == "approved":
+        return redirect(url_for("create_booking_ticket", booking_id=booking_id))
     return redirect(url_for("team_dashboard", section="automation", _anchor="review-bookings"))
 
 
+# Save and audit progress changes, then return to the view that submitted them.
 @app.route("/planner/bookings/<int:booking_id>/progress", methods=["POST"])
 def booking_progress(booking_id: int) -> str:
     section = "automation" if request.form.get("return_to") == "automation" else "testing"
@@ -3107,6 +3816,7 @@ def booking_progress(booking_id: int) -> str:
     return redirect(back)
 
 
+# Reopen a failed Jira attempt only after the user confirms no ticket was created.
 @app.route("/planner/bookings/<int:booking_id>/retry", methods=["POST"])
 def retry_failed_booking(booking_id: int) -> str:
     if request.form.get("verified_no_ticket") != "1":
@@ -3121,14 +3831,59 @@ def retry_failed_booking(booking_id: int) -> str:
     return redirect(url_for("team_dashboard", section="automation", _anchor="review-bookings"))
 
 
+def _inspect_booking_asset(client: JiraClient, asset_key: str, project: str) -> tuple[dict, bool]:
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*-\d+", asset_key):
+        raise ValueError("Enter a valid Jira Assets object key, such as PHUB-123.")
+    asset = client.get_insight_object(asset_key)
+    if asset["object_type"] != "FZG" or asset["key"].casefold() != asset_key.casefold():
+        raise ValueError("Choose a valid FZG vehicle Assets object.")
+    fields = client.get_issue_create_fields(project, "Task")
+    return asset, VEHICLE_ASSET_FIELD_ID in fields
+
+
+def _write_booking_asset_history(client: JiraClient, asset_key: str, booking: dict, issue_key: str) -> None:
+    asset = client.get_insight_object(asset_key)
+    if asset["object_type"] != "FZG" or asset["key"].casefold() != asset_key.casefold():
+        raise ValueError("The selected Assets object is no longer an FZG vehicle.")
+    attribute_id = history_attribute_id(client)
+    if attribute_id is None:
+        raise ValueError("The FZG history attribute does not exist in Jira Assets.")
+    raw_history = (asset["attributes"].get(HISTORY_NAME) or [""])[0] or ""
+    history = json.loads(raw_history) if raw_history else []
+    if not isinstance(history, list) or not all(isinstance(item, dict) for item in history):
+        raise ValueError("The Assets vehicle history is not a list of entries.")
+    if any(item.get("ticket") == issue_key for item in history):
+        return
+    history.append({
+        "date": booking["planned_date"] or booking["period"],
+        "activity": booking["activity"],
+        "description": booking["description"],
+        "ticket": issue_key,
+        "due_date": "",
+        "priority": "",
+        "assignee": "",
+    })
+    client.update_insight_object_attributes(
+        int(asset["id"]), {attribute_id: [json.dumps(history, ensure_ascii=False)]}, confirm=True,
+    )
+
+
+# Preview the checklist and create a Jira ticket only after explicit confirmation.
 @app.route("/planner/bookings/<int:booking_id>/create-ticket", methods=["GET", "POST"])
 def create_booking_ticket(booking_id: int) -> str:
     booking = get_booking(booking_id)
     if booking is None:
         abort(404)
-    if booking["status"] != "approved":
-        return render_page("Cannot create Jira ticket", '<p class="warn">Only an approved booking can be turned into a Jira ticket.</p>'
+    combined_approval = (request.form if request.method == "POST" else request.args).get("approval") == "1"
+    expected_status = "pending" if combined_approval else "approved"
+    if booking["status"] != expected_status:
+        message = (
+            "This booking is no longer pending. Review its current status before continuing."
+            if combined_approval else "Only an approved booking can be turned into a Jira ticket."
+        )
+        return render_page("Cannot create Jira ticket", f'<p class="warn">{message}</p>'
                            + f'<p><a href="{url_for("booking_review")}">Back to review</a></p>'), 409
+    preview_args = {"approval": "1"} if combined_approval else {}
     template_names = sorted(
         path.stem for path in TEMPLATES_DIR.glob("*.yaml")
         if re.fullmatch(r"[a-zA-Z0-9_-]+", path.stem)
@@ -3137,13 +3892,15 @@ def create_booking_ticket(booking_id: int) -> str:
         if request.form.get("confirm") != "1":
             abort(400, description="Explicit confirmation is required to create a Jira ticket.")
         checklist_template = request.form.get("checklist_template", "").strip()
+        asset_key = request.form.get("asset_key", "").strip().upper()
     else:
         checklist_template = request.args.get("checklist_template", booking["checklist_template"]).strip()
+        asset_key = (request.args.get("asset_choice") or request.args.get("asset_key", "")).strip().upper()
     if checklist_template and checklist_template not in template_names:
         return render_page(
             "Checklist selection failed",
             '<p class="warn">Select an available checklist template.</p>'
-            f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, checklist_template="")}">Choose a template</a></p>',
+            f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, checklist_template="", **preview_args)}">Choose a template</a></p>',
         ), 400
     if request.method == "POST" and not checklist_template:
         abort(400, description="Select and preview a checklist template before creating a ticket.")
@@ -3153,26 +3910,127 @@ def create_booking_ticket(booking_id: int) -> str:
             '<p class="warn">No checklist templates are available. Contact an admin.</p>'
             f'<p><a href="{url_for("booking_review")}">Back to review</a></p>',
         ), 400
+    serializer = URLSafeTimedSerializer(app.secret_key, salt="booking-ticket-approval-preview")
+    if request.method == "POST" and combined_approval:
+        try:
+            preview = serializer.loads(request.form.get("preview_token", ""), max_age=1800)
+        except BadSignature:
+            preview = None
+        expected_preview = {
+            "booking_id": booking_id,
+            "revision": booking["revision"],
+            "checklist": checklist_template,
+            "asset": asset_key,
+            "asset_field_available": request.form.get("asset_field_available", ""),
+        }
+        if preview != expected_preview:
+            return render_page(
+                "Preview changed or expired",
+                '<p class="warn">The booking or ticket selection changed, or the preview expired. Preview it again before confirming.</p>'
+                f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, **preview_args)}">Return to preview</a></p>',
+            ), 409
 
     template_options = "".join(
         f'<option value="{esc(name)}" {"selected" if name == checklist_template else ""}>{esc(name)}</option>'
         for name in template_names
     )
+    asset_options = ""
+    if request.method == "GET" and request.args.get("find_assets") == "1":
+        try:
+            asset_client = JiraClient(load_config())
+            try:
+                vehicles = asset_client.list_test_vehicles(
+                    iql="objectType = FZG",
+                    object_type_id=JiraClient.INSIGHT_VEHICLE_ASSET_OBJECT_TYPE_ID,
+                    object_schema_id=JiraClient.INSIGHT_VEHICLE_ASSET_SCHEMA_ID,
+                    max_results=1000,
+                )
+            finally:
+                asset_client.close()
+        except (RuntimeError, ValueError, KeyError, TypeError, httpx.HTTPError) as exc:
+            log_event(f"Assets vehicle list for booking #{booking_id} failed ({type(exc).__name__}).", "error")
+            return render_page(
+                "Assets vehicles unavailable",
+                '<p class="warn">Could not load Assets vehicles. Check Jira access or continue without an Assets vehicle.</p>'
+                f'<p>Error type: {esc(type(exc).__name__)}</p>'
+                f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, checklist_template=checklist_template, **preview_args)}">Back to preview</a></p>',
+            ), 503
+        asset_options = (
+            '<label>Select an Assets vehicle <select name="asset_choice">'
+            '<option value="">Use the key entered above</option>'
+            + "".join(
+                f'<option value="{esc(vehicle["key"])}">{esc(vehicle["label"])} ({esc(vehicle["key"])})</option>'
+                for vehicle in sorted(vehicles, key=lambda item: (item["label"].casefold(), item["key"]))
+            )
+            + '</select></label><span class="form-hint">The list shows up to 1,000 vehicles; '
+              'you can also enter an exact key above.</span>'
+        )
     selection_form = (
-        f'<form method="get" action="{url_for("create_booking_ticket", booking_id=booking_id)}">'
-        '<label>Checklist template <select name="checklist_template" required>'
+        f'<form method="get" data-ticket-selection action="{url_for("create_booking_ticket", booking_id=booking_id)}">'
+        + ('<input type="hidden" name="approval" value="1">' if combined_approval else "")
+        + '<label>Checklist template <select name="checklist_template" required>'
         f'<option value="">Select a template</option>{template_options}</select></label> '
+        f'<label>Jira Assets vehicle key (optional) <input name="asset_key" value="{esc(asset_key)}" '
+        'placeholder="For example PHUB-123"></label> '
+        '<span class="form-hint">Enter the exact FZG vehicle object key from Jira Assets. '
+        'The preview shows the vehicle details before you confirm.</span> '
+        + asset_options
+        + '<button type="submit" name="find_assets" value="1" formnovalidate>Find Assets vehicles</button> '
         '<button type="submit">Preview checklist</button></form>'
     )
-    if not checklist_template:
+    booking_fields = (
+        ("Booking ID", str(booking_id)),
+        ("Submitted by", booking["created_by"]),
+        ("Vehicle", booking["vehicle_label"]),
+        ("VIN", booking["vehicle_vin"] or "Not recorded"),
+        ("Activity", booking["activity"]),
+        ("Week", booking["period"]),
+        ("Planned date(s)", _booking_date_range_label(booking)),
+        ("Notes", booking["description"] or "None"),
+    )
+    if not checklist_template or request.args.get("find_assets") == "1":
+        detail_rows = "".join(
+            f'<div><dt>{esc(label)}</dt><dd>{esc(value)}</dd></div>'
+            for label, value in booking_fields
+        )
         return render_page(
-            "Choose checklist template",
-            f'<p><strong>Vehicle:</strong> {esc(booking["vehicle_label"])}<br>'
-            f'<strong>Activity:</strong> {esc(booking["activity"])}</p>'
-            + selection_form
-            + f'<p><a href="{url_for("booking_review")}">Back to review</a></p>',
+            "Preview Jira ticket",
+            '<div class="ticket-preview">'
+            '<p class="ticket-preview-intro">No Jira ticket has been created yet. Select a checklist to complete the preview.</p>'
+            '<section class="card ticket-preview-card" aria-labelledby="ticket-booking-title">'
+            '<h2 id="ticket-booking-title">Booking details</h2>'
+            f'<dl class="ticket-preview-fields">{detail_rows}</dl></section>'
+            '<section class="card ticket-preview-card" aria-labelledby="ticket-selection-title">'
+            '<h2 id="ticket-selection-title">Choose checklist template</h2>'
+            '<p class="form-hint">Choose a checklist and optionally an Assets vehicle, then select Preview checklist.</p>'
+            + selection_form + '</section>'
+            + f'<p><a href="{url_for("booking_review")}">Back to review</a></p></div>',
         )
     project = os.environ.get("JIRA_PROJECT_KEY", "PHUB").strip() or "PHUB"
+    asset = None
+    asset_field_available = False
+    if asset_key:
+        try:
+            asset_client = JiraClient(load_config())
+            try:
+                asset, asset_field_available = _inspect_booking_asset(asset_client, asset_key, project)
+            finally:
+                asset_client.close()
+        except (RuntimeError, ValueError, KeyError, TypeError, httpx.HTTPError) as exc:
+            log_event(f"Assets lookup for booking #{booking_id} failed ({type(exc).__name__}).", "error")
+            return render_page(
+                "Assets vehicle could not be verified",
+                '<p class="warn">Could not verify the selected Assets vehicle and Jira creation fields. '
+                'Check the object key and Jira access, or remove the key to create a ticket without an Assets link.</p>'
+                f'<p>Error type: {esc(type(exc).__name__)}</p>'
+                f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, checklist_template=checklist_template, **preview_args)}">Back to preview</a></p>',
+            ), 503
+        if request.method == "POST" and request.form.get("asset_field_available") != str(int(asset_field_available)):
+            return render_page(
+                "Jira Assets configuration changed",
+                '<p class="warn">The Assets field availability changed. Preview the ticket again before confirming.</p>'
+                f'<p><a href="{url_for("create_booking_ticket", booking_id=booking_id, checklist_template=checklist_template, asset_key=asset_key, **preview_args)}">Back to preview</a></p>',
+            ), 409
     summary = f"{booking['period']} - {booking['activity']} - {booking['vehicle_label']}"
     description = (
         "Created from an approved campaign booking in the Test Manager.\n"
@@ -3184,7 +4042,7 @@ def create_booking_ticket(booking_id: int) -> str:
         f"Description: {booking['description']}\n"
         f"Checklist template: {checklist_template}\n"
         f"Booking ID: {booking_id}\n"
-        f"Jira Assets reference: {booking['jira_asset_key']}\n"
+        + (f"Jira Assets reference: {asset_key}\n" if asset_key else "")
     )
     try:
         checklist = render_test_checklist(
@@ -3198,20 +4056,80 @@ def create_booking_ticket(booking_id: int) -> str:
         return render_page("Checklist preview failed", f'<p class="warn">Could not render the selected checklist: {esc(exc)}</p>'
                            + f'<p><a href="{url_for("booking_review")}">Back to review</a></p>'), 400
     if request.method == "GET":
+        if asset:
+            vin = (asset["attributes"].get("VIN") or [""])[0] or "Not recorded"
+            asset_preview = (
+                f'<p><strong>Selected Assets vehicle:</strong> {esc(asset["label"])} '
+                f'({esc(asset_key)})<br><strong>Assets VIN:</strong> {esc(vin)}</p>'
+                + (
+                    '<p class="msg">The ticket will include the Jira Assets vehicle link.</p>'
+                    if asset_field_available
+                    else '<p class="warn">The Assets field is not available on the Jira Task creation screen. '
+                         'The ticket will not have a formal Assets link; its vehicle history update will still be attempted.</p>'
+                )
+                + '<p class="form-hint">Check that this is the correct vehicle before confirming. '
+                  'The ticket will be added to this Assets vehicle’s history.</p>'
+            )
+        else:
+            asset_preview = '<p class="form-hint">No Assets vehicle selected; no Assets link or history update will be made.</p>'
+        if combined_approval:
+            preview_token = serializer.dumps({
+                "booking_id": booking_id, "revision": booking["revision"], "checklist": checklist_template,
+                "asset": asset_key, "asset_field_available": str(int(asset_field_available)),
+            })
+            confirmation = (
+                '<input type="hidden" name="approval" value="1">'
+                f'<input type="hidden" name="preview_token" value="{esc(preview_token)}">'
+                '<input type="hidden" name="confirm" value="1">'
+                '<button type="submit">Approve and create Jira ticket</button>'
+            )
+        else:
+            confirmation = (
+                '<label><input type="checkbox" name="confirm" value="1" required> I reviewed this booking and want to create one Jira ticket.</label>'
+                '<button type="submit">Confirm and create Jira ticket</button>'
+            )
+        fields = booking_fields + (
+            ("Project", project),
+            ("Issue type", "Task"),
+            ("Summary", summary),
+            ("Checklist template", checklist_template),
+        )
+        detail_rows = "".join(
+            f'<div><dt>{esc(label)}</dt><dd>{esc(value)}</dd></div>'
+            for label, value in fields
+        )
+        checklist_lines = "".join(
+            f'<li class="{"ticket-checklist-heading" if line.startswith("#") else "ticket-checklist-item"}">{esc(line) if line else "&nbsp;"}</li>'
+            for line in checklist.split("\n")
+        )
         return render_page(
             "Preview Jira ticket",
-            f'<p><strong>Vehicle:</strong> {esc(booking["vehicle_label"])}<br>'
-            f'<strong>Activity:</strong> {esc(booking["activity"])}<br>'
-            f'<strong>Week/date:</strong> {esc(booking["period"])} / {esc(_booking_date_range_label(booking))}<br>'
-            f'<strong>Project:</strong> {esc(project)}<br><strong>Summary:</strong> {esc(summary)}</p>'
-            + selection_form
-            + f'<h3>Checklist preview ({esc(checklist_template)})</h3><pre>{esc(checklist)}</pre>'
-            "<p>This action creates a Jira issue and attempts to write its checklist. It does not create or assign an Agile sprint.</p>"
-            f'<form method="post" action="{url_for("create_booking_ticket", booking_id=booking_id)}">'
+            '<div class="ticket-preview">'
+            '<p class="ticket-preview-intro">Review the details below. No Jira ticket has been created yet.</p>'
+            '<section class="card ticket-preview-card" aria-labelledby="ticket-details-title">'
+            '<h2 id="ticket-details-title">Booking and ticket details</h2>'
+            f'<dl class="ticket-preview-fields">{detail_rows}</dl>'
+            '<details class="ticket-preview-disclosure"><summary>View exact Jira description</summary>'
+            f'<pre class="ticket-description">{esc(description)}</pre></details></section>'
+            '<section class="card ticket-preview-card" aria-labelledby="ticket-selection-title">'
+            '<h2 id="ticket-selection-title">Checklist and Assets selection</h2>'
+            '<p class="form-hint">Changes apply only after you select Preview checklist again.</p>'
+            + selection_form + asset_preview
+            + '</section>'
+            '<section class="card ticket-preview-card" aria-labelledby="ticket-checklist-title">'
+            f'<details open><summary id="ticket-checklist-title">Checklist preview ({esc(checklist_template)})</summary>'
+            '<p class="form-hint">Each line is shown as it will be sent to Jira. + means checked; - means unchecked.</p>'
+            f'<ol class="ticket-checklist">{checklist_lines}</ol></details></section>'
+            '<section class="card ticket-preview-card" aria-labelledby="ticket-confirm-title">'
+            '<h2 id="ticket-confirm-title">Confirm action</h2>'
+            '<p>This action creates a Jira issue and attempts to write its checklist. It does not create or assign an Agile sprint.</p>'
+            '<p class="warn" role="status" data-ticket-selection-notice hidden>Selection changed. Select Preview checklist again before confirming.</p>'
+            f'<form method="post" data-ticket-confirmation action="{url_for("create_booking_ticket", booking_id=booking_id)}">'
             f'<input type="hidden" name="checklist_template" value="{esc(checklist_template)}">'
-            '<label><input type="checkbox" name="confirm" value="1" required> I reviewed this booking and want to create one Jira ticket.</label>'
-            '<button type="submit">Confirm and create Jira ticket</button></form>'
-            f'<p><a href="{url_for("booking_review")}">Back to review</a></p>',
+            f'<input type="hidden" name="asset_key" value="{esc(asset_key)}">'
+            f'<input type="hidden" name="asset_field_available" value="{int(asset_field_available)}">'
+            + confirmation + '</form></section>'
+            f'<p><a href="{url_for("booking_review")}">Back to review</a></p></div>',
         )
 
     try:
@@ -3219,10 +4137,16 @@ def create_booking_ticket(booking_id: int) -> str:
     except RuntimeError as exc:
         return render_page("Jira not configured", f'<p class="warn">{esc(exc)}</p><p><a href="{url_for("booking_review")}">Back to review</a></p>'), 503
     client = JiraClient(config)
-    if not claim_booking_creation(booking_id, checklist_template=checklist_template):
+    claimed = (
+        claim_pending_booking_creation(booking_id, _current_actor(), booking["revision"], checklist_template)
+        if combined_approval else claim_booking_creation(booking_id, checklist_template=checklist_template)
+    )
+    if not claimed:
         client.close()
         return render_page("Ticket creation already started", '<p class="warn">This booking is no longer available for ticket creation. Check its status and Jira before retrying.</p>'
                            + f'<p><a href="{url_for("booking_review")}">Back to review</a></p>'), 409
+    if combined_approval:
+        record_audit_event(_current_actor(), "Booking approved", f"Booking #{booking_id}")
     record_audit_event(_current_actor(), "Selected checklist template", f"Booking #{booking_id}; template {checklist_template}")
     try:
         vehicle = Vehicle(
@@ -3234,13 +4158,16 @@ def create_booking_ticket(booking_id: int) -> str:
             scope=booking["purpose"],
             key=booking["jira_asset_key"],
         )
+        extra_fields = vehicle_link_fields(vehicle)
+        if asset_key and asset_field_available:
+            extra_fields[VEHICLE_ASSET_FIELD_ID] = [{"key": asset_key}]
         result = client.create_issue(
             project,
             "Task",
             summary,
             description,
             confirm=True,
-            extra_fields=vehicle_link_fields(vehicle),
+            extra_fields=extra_fields,
         )
         issue_key = result.get("key")
         if not issue_key:
@@ -3257,6 +4184,27 @@ def create_booking_ticket(booking_id: int) -> str:
         ), 502
     finally:
         client.close()
+
+    asset_notice = ""
+    if asset_key:
+        try:
+            asset_client = JiraClient(config)
+            try:
+                _write_booking_asset_history(asset_client, asset_key, booking, issue_key)
+            finally:
+                asset_client.close()
+        except (ValueError, KeyError, TypeError, httpx.HTTPError) as exc:
+            log_event(f"Assets history update for {issue_key} failed ({type(exc).__name__}).", "error")
+            record_audit_event(_current_actor(), "Assets history update failed", f"Booking #{booking_id}; ticket {issue_key}; asset {asset_key}; {type(exc).__name__}")
+            asset_notice = (
+                '<p class="warn">The Jira ticket was created, but the Assets history update failed. '
+                'Do not create the ticket again; check the vehicle history in Jira and update it manually.</p>'
+            )
+        else:
+            record_audit_event(_current_actor(), "Updated Assets vehicle history", f"Booking #{booking_id}; ticket {issue_key}; asset {asset_key}")
+            asset_notice = '<p class="msg">The selected Assets vehicle history was updated.</p>'
+        if not asset_field_available:
+            asset_notice += '<p class="warn">The ticket has no formal Assets link because the Jira field was unavailable.</p>'
 
     checklist_pending = False
     try:
@@ -3297,11 +4245,12 @@ def create_booking_ticket(booking_id: int) -> str:
         "Jira ticket created",
         f'<p class="msg">Created <a href="{esc(config.effective_web_base_url)}/jira/browse/{esc(issue_key)}" target="_blank">{esc(issue_key)}</a>. '
         "The ticket key is stored on the booking.</p>"
-        f"{checklist_notice}"
+        f"{asset_notice}{checklist_notice}"
         f'<p><a href="{url_for("booking_review")}">Back to review</a></p>',
     )
 
 
+# Share vehicle fields between add and edit forms without exposing the stored Jira reference.
 def _vehicle_fields_form(vehicle: dict | None = None, *, include_section: bool = False) -> str:
     vehicle = vehicle or {}
     field_specs = (
@@ -3345,22 +4294,25 @@ def vehicle_management() -> str:
     return team_dashboard("vehicles")
 
 
+# Open the comment editor from the row's actions without opening the full vehicle form.
 def _vehicle_comment_editor(vehicle: dict) -> str:
     comment = vehicle.get("comment", "")
-    summary = (
-        f'<span class="vehicle-comment-text">{esc(comment)}</span>'
-        if comment
-        else '<span class="form-hint">Add comment</span>'
-    )
+    label = "Edit comment" if comment else "Add comment"
+    dialog_id = f'vehicle-comment-{vehicle["id"]}'
     return (
-        f'<details class="vehicle-comment"><summary title="Edit comment">{summary}</summary>'
+        f'<button type="button" aria-haspopup="dialog" aria-controls="{dialog_id}" '
+        f'onclick="document.getElementById(\'{dialog_id}\').showModal()">{label}</button>'
+        f'<dialog class="vehicle-dialog" id="{dialog_id}" aria-labelledby="{dialog_id}-title">'
+        f'<div class="vehicle-dialog-heading"><h2 id="{dialog_id}-title">{label}: {esc(vehicle["label"])}</h2>'
+        '<button type="button" onclick="this.closest(\'dialog\').close()" aria-label="Close comment editor">Close</button></div>'
         f'<form method="post" action="{url_for("vehicle_comment", vehicle_id=vehicle["id"])}">'
         f'<textarea name="comment" rows="3" maxlength="{MAX_VEHICLE_COMMENT_LENGTH}" '
         f'aria-label="Comment for {esc(vehicle["label"])}">{esc(comment)}</textarea>'
-        '<button type="submit">Save comment</button></form></details>'
+        '<button type="submit">Save comment</button></form></dialog>'
     )
 
 
+# Save comment changes and return to the vehicle's active or inactive list.
 @app.route("/vehicles/<int:vehicle_id>/comment", methods=["POST"])
 def vehicle_comment(vehicle_id: int) -> str:
     vehicle = get_vehicle(vehicle_id)
@@ -3382,44 +4334,180 @@ def vehicle_comment(vehicle_id: int) -> str:
     return redirect(url_for("team_dashboard", section="vehicles", **show, _anchor="vehicle-details"))
 
 
+# Show the active fleet by default, with separate controls for the inactive list.
 def _vehicle_management_section() -> str:
     all_vehicles = list_vehicles(active_only=False)
     show_inactive = request.args.get("show") == "inactive"
     vehicles = [vehicle for vehicle in all_vehicles if bool(vehicle["active"]) != show_inactive]
     rows = []
     for group_name, group_vehicles in _group_vehicles(vehicles):
-        rows.append(f'<tr class="vehicle-group-header"><th colspan="10">{esc(group_name)}</th></tr>')
-        rows.extend(
-            f'<tr><td>{esc(vehicle["label"])}</td><td>{esc(vehicle["logger"] or "—")}</td>'
-            f'<td>{esc(vehicle["series"])}</td><td>{esc(vehicle["cluster"])}</td>'
-            f'<td>{esc(vehicle["market"])}</td><td>{esc(vehicle["vr_stand"])}</td>'
-            f'<td>{esc(vehicle["purpose"])}</td><td>{esc(vehicle["vin"])}</td>'
-            f'<td>{_vehicle_comment_editor(vehicle)}</td><td><a href="{url_for("vehicle_edit", vehicle_id=vehicle["id"])}">Edit</a>'
-            f'{_vehicle_reactivate_button(vehicle) if show_inactive else ""}</td></tr>'
-            for vehicle in group_vehicles
-        )
+        rows.append(f'<tr class="vehicle-group-header"><th colspan="9">{esc(group_name)}</th></tr>')
+        for vehicle in group_vehicles:
+            search_text = " ".join(
+                str(vehicle.get(key) or "")
+                for key in ("label", "logger", "series", "cluster", "market", "vr_stand",
+                            "purpose", "vin", "comment", "blocked_reason")
+            )
+            rows.append(
+                ('<tr class="vehicle-blocked-row">' if vehicle_block_bounds(vehicle) else '<tr>')
+                + f'<td>{esc(vehicle["label"])}</td>'
+                f'<td data-vehicle-search="{esc(search_text)}">{esc(vehicle["logger"] or "—")}</td>'
+                f'<td>{esc(vehicle["series"])}</td><td>{esc(vehicle["cluster"])}</td>'
+                f'<td>{esc(vehicle["market"])}</td><td>{esc(vehicle["vr_stand"])}</td>'
+                f'<td>{esc(vehicle["purpose"])}</td><td>{esc(vehicle["vin"])}</td>'
+                f'<td>{_vehicle_actions_menu(vehicle)}</td></tr>'
+                + (f'<tr class="vehicle-block-note-row"><td colspan="9">{_vehicle_block_status(vehicle)}</td></tr>'
+                   if vehicle_block_bounds(vehicle) else "")
+                + (f'<tr class="vehicle-comment-note-row"><td colspan="9"><div class="vehicle-comment-text">'
+                   f'<strong>Note:</strong> {esc(vehicle["comment"])}</div></td></tr>'
+                   if vehicle.get("comment", "").strip() else "")
+            )
     list_title = "Inactive vehicles" if show_inactive else "Active vehicles"
-    switch_url = url_for("vehicle_management") if show_inactive else url_for("vehicle_management", show="inactive")
-    switch_label = "Show active vehicles" if show_inactive else "Show inactive vehicles"
+    tabs = '<div class="view-tabs" aria-label="Vehicle status">' + "".join(
+        f'<a href="{url_for("vehicle_management", **({"show": "inactive"} if inactive else {}))}"'
+        f' class="{"selected" if inactive == show_inactive else ""}"'
+        + (' aria-current="page"' if inactive == show_inactive else "")
+        + f'>{label}</a>'
+        for inactive, label in ((False, "Active vehicles"), (True, "Inactive vehicles"))
+    ) + "</div>"
     table_content = (
         f'<div class="table-wrap"><table><tr><th>Name</th><th>Logger</th><th>Baureihe</th>'
         f'<th>Cluster</th><th>Markt</th><th>VR-Stand</th><th>Verwendungszweck</th><th>VIN</th>'
-        f'<th>Comment</th><th></th></tr>{"".join(rows)}</table></div>'
+        f'<th>Actions</th></tr>{"".join(rows)}</table></div>'
         if rows
         else f'<p class="form-hint">No {list_title.casefold()} to display.</p>'
     )
     status_control = (
-        ""
+        _vehicle_deactivate_form([vehicle for vehicle in all_vehicles if vehicle["active"]])
         if show_inactive
-        else _vehicle_deactivate_form([vehicle for vehicle in all_vehicles if vehicle["active"]])
+        else ""
+    )
+    add_control = "" if show_inactive else (
+        '<button type="button" aria-haspopup="dialog" aria-controls="add-vehicle-dialog" '
+        'onclick="document.getElementById(\'add-vehicle-dialog\').showModal()">Add new vehicle</button>'
+    )
+    add_dialog = "" if show_inactive else (
+        '<dialog class="vehicle-dialog" id="add-vehicle-dialog" aria-labelledby="add-vehicle-title">'
+        '<div class="vehicle-dialog-heading"><h2 id="add-vehicle-title">Add new vehicle</h2>'
+        '<button type="button" onclick="this.closest(\'dialog\').close()" aria-label="Close add vehicle">Close</button></div>'
+        f'<form class="planner-form" method="post" action="{url_for("vehicle_create")}">'
+        f'{_vehicle_fields_form(include_section=True)}'
+        '<button class="primary-action" type="submit">Add vehicle</button></form></dialog>'
     )
     body = f"""
-    <p>Users maintain current/new vehicle records.</p>
-    <div class="vehicle-management-heading"><h2>{list_title}</h2>{status_control}</div>
-    <p class="vehicle-list-switch"><a href="{switch_url}">{switch_label}</a></p>
+    <p class="planner-intro">View and manage current and inactive vehicle records.</p>
+    {tabs}
+    <div class="card vehicle-panel" data-vehicle-filter-panel aria-label="{list_title}">
+    <div class="vehicle-management-heading"><h3>{list_title}</h3>{add_control}{status_control}</div>
+    <div class="section-filter" data-vehicle-filter-controls hidden>
+      <label>Search vehicles <input type="search" placeholder="Name, VIN, details or notes" autocomplete="off"></label>
+      <span class="section-filter-result" data-vehicle-filter-result role="status"></span>
+    </div>
     {table_content}
+    </div>
+    {add_dialog}
     """
-    return f'<section class="team-section" id="vehicle-details"><h2>Vehicle details</h2>{body}</section>'
+    return (
+        '<section class="team-section section-page" id="vehicle-details">'
+        '<p class="booking-eyebrow">FLEET MANAGEMENT</p><h2>Vehicle details</h2>'
+        f'{body}</section>'
+    )
+
+
+def _vehicle_actions_menu(vehicle: dict) -> str:
+    """Keep row actions together while preserving admin-only destructive/block controls."""
+    admin_actions = ""
+    if session.get("role") == "admin":
+        admin_actions = (
+            f'<a href="{url_for("vehicle_edit", vehicle_id=vehicle["id"], _anchor="delete-vehicle")}">Delete</a>'
+            + _vehicle_block_control(vehicle)
+        )
+    return (
+        f'<details class="vehicle-actions"><summary aria-label="Actions for {esc(vehicle["label"])}">&#8943;</summary>'
+        f'<div class="vehicle-actions-list"><a href="{url_for("vehicle_edit", vehicle_id=vehicle["id"])}">Edit</a>'
+        + _vehicle_comment_editor(vehicle)
+        + admin_actions
+        + (_vehicle_reactivate_button(vehicle) if not vehicle["active"] else "")
+        + '</div></details>'
+    )
+
+
+def _vehicle_block_status(vehicle: dict) -> str:
+    """Keep temporary unavailability visible even when the row's actions are collapsed."""
+    bounds = vehicle_block_bounds(vehicle)
+    if bounds is None:
+        return ""
+    end = f" to {bounds[1].isoformat()}" if bounds[1] != date.max else " until further notice"
+    reason = f' — Reason: {esc(vehicle["blocked_reason"])}' if vehicle["blocked_reason"] else ""
+    return (
+        f'<div class="vehicle-block-status"><span class="vehicle-blocked-label">'
+        f'Not Available from {bounds[0].isoformat()}{end}{reason}</span></div>'
+    )
+
+
+def _vehicle_block_control(vehicle: dict) -> str:
+    """Offer the block/unblock switch within the admin's vehicle actions."""
+    blocked = vehicle_block_bounds(vehicle) is not None
+    action = url_for("admin_vehicle_block", vehicle_id=vehicle["id"])
+    switch_attributes = (
+        f'class="vehicle-block-switch" role="switch" aria-checked="{str(blocked).lower()}" '
+        f'aria-label="Blocked: {esc(vehicle["label"])}"'
+    )
+    return_to = "inactive" if not vehicle["active"] else "active"
+    hidden = f'<input type="hidden" name="return_to" value="{return_to}">'
+    if blocked:
+        return (
+            f'<form method="post" action="{action}">{hidden}<input type="hidden" name="blocked" value="0">'
+            f'<button type="submit" {switch_attributes}>Unblock vehicle</button></form>'
+        )
+    dialog_id = f'block-vehicle-{vehicle["id"]}'
+    return (
+        f'<button type="button" {switch_attributes} aria-haspopup="dialog" aria-controls="{dialog_id}" '
+        f'onclick="document.getElementById(\'{dialog_id}\').showModal()">Block vehicle</button>'
+        f'<dialog class="vehicle-dialog" id="{dialog_id}" aria-labelledby="{dialog_id}-title">'
+        f'<div class="vehicle-dialog-heading"><h2 id="{dialog_id}-title">Block {esc(vehicle["label"])}</h2>'
+        '<button type="button" onclick="this.closest(\'dialog\').close()" aria-label="Close block vehicle">Close</button></div>'
+        '<p>Not ready for testing from today. Existing bookings will be kept.</p>'
+        f'<form method="post" action="{action}">{hidden}<input type="hidden" name="blocked" value="1">'
+        f'<label>Reason (optional)<textarea name="reason" maxlength="{MAX_VEHICLE_COMMENT_LENGTH}" rows="3"></textarea></label>'
+        f'<label>Blocked through (optional)<input type="date" name="until" min="{date.today().isoformat()}"></label>'
+        '<p class="form-hint">The end date is included. Leave empty to block until manually unblocked.</p>'
+        '<button type="submit">Block vehicle</button></form></dialog>'
+    )
+
+
+@app.route("/vehicles/<int:vehicle_id>/block", methods=["POST"])
+def admin_vehicle_block(vehicle_id: int):
+    vehicle = get_vehicle(vehicle_id)
+    if vehicle is None:
+        abort(404)
+    state = request.form.get("blocked", "")
+    if state not in ("0", "1"):
+        abort(400, description="Choose whether the vehicle is blocked.")
+    try:
+        set_vehicle_blocked(
+            vehicle_id, state == "1", request.form.get("reason", ""), request.form.get("until", ""),
+        )
+    except ValueError as exc:
+        return render_page(
+            "Vehicle block not saved", f'<p class="warn">{esc(exc)}</p>'
+            f'<p><a href="{url_for("vehicle_management")}">Back to vehicles</a></p>',
+        ), 400
+    actor = _current_actor()
+    details = f"Vehicle ID {vehicle_id}; {vehicle['label']}"
+    if state == "1":
+        details += (
+            f"; through {request.form.get('until', '').strip() or 'until unblocked'}; "
+            f"reason: {request.form.get('reason', '').strip()}"
+        )
+    record_audit_event(
+        actor, "Blocked vehicle" if state == "1" else "Unblocked vehicle",
+        details,
+    )
+    log_event(f"Vehicle #{vehicle_id} {'blocked' if state == '1' else 'unblocked'} by {actor}.")
+    session["team_notice"] = f"{vehicle['label']} is {'blocked — not ready for testing' if state == '1' else 'unblocked'}."
+    show = {"show": "inactive"} if request.form.get("return_to") == "inactive" else {}
+    return redirect(url_for("vehicle_management", **show))
 
 
 def _vehicle_reactivate_button(vehicle: dict) -> str:
@@ -3432,6 +4520,7 @@ def _vehicle_reactivate_button(vehicle: dict) -> str:
     )
 
 
+# Let users select an active vehicle to remove from booking choices without deleting it.
 def _vehicle_deactivate_form(active_vehicles: list[dict]) -> str:
     if not active_vehicles:
         return ""
@@ -3455,6 +4544,7 @@ def _vehicle_deactivate_form(active_vehicles: list[dict]) -> str:
     )
 
 
+# Move a vehicle between lists without touching its bookings or history.
 @app.route("/vehicles/status", methods=["POST"])
 def vehicle_status() -> str:
     active = request.form.get("active") == "1"
@@ -3483,6 +4573,101 @@ def vehicle_status() -> str:
     return redirect(back)
 
 
+def _dashboard_section(shortcuts: str) -> str:
+    """Summarize planned dates using the same inclusive availability rules as booking."""
+    today = date.today()
+    vehicles = list_vehicles(active_only=False)
+    active_vehicles = [vehicle for vehicle in vehicles if vehicle["active"]]
+    all_bookings = list_bookings(limit=-1)
+    dated_bookings = []
+    for booking in all_bookings:
+        if booking["status"] == "rejected":
+            continue
+        bounds = booking_date_bounds(booking)
+        if bounds:
+            dated_bookings.append({"booking": booking, "start": bounds[0], "end": bounds[1]})
+
+    current = sorted(
+        (item for item in dated_bookings if item["start"] <= today <= item["end"]),
+        key=lambda item: (item["booking"]["vehicle_label"].casefold(), item["start"], item["booking"]["id"]),
+    )
+    upcoming = sorted(
+        (item for item in dated_bookings if item["start"] > today),
+        key=lambda item: (item["start"], item["booking"]["vehicle_label"].casefold(), item["booking"]["id"]),
+    )
+    by_vehicle: dict[int, list[dict]] = {}
+    for item in current:
+        by_vehicle.setdefault(item["booking"]["vehicle_id"], []).append(item)
+
+    rows = []
+    available = 0
+    booked_active = 0
+    for vehicle in active_vehicles:
+        bookings = by_vehicle.get(vehicle["id"], [])
+        block = vehicle_block_bounds(vehicle)
+        blocked = bool(block and block[0] <= today <= block[1])
+        if bookings:
+            booked_active += 1
+        if blocked:
+            status = "Not available"
+        elif any(_booking_progress(item["booking"]) == "in_progress" for item in bookings):
+            status = "In use"
+        elif bookings:
+            status = "Reserved"
+        else:
+            status = "Available"
+            available += 1
+        rows.append({"vehicle": vehicle, "status": status, "bookings": bookings})
+
+    status_filter = request.args.get("vehicle_status", "all")
+    statuses = {
+        "all": None, "available": "Available", "reserved": "Reserved",
+        "in_use": "In use", "blocked": "Not available",
+    }
+    if status_filter not in statuses:
+        abort(400, description="Choose a valid vehicle status.")
+    limit_value = request.args.get("vehicle_limit", "10")
+    if limit_value not in ("10", "15", "25", "50", "all"):
+        abort(400, description="Choose a valid number of vehicles.")
+    page_value = request.args.get("vehicle_page", "1")
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", page_value):
+        abort(400, description="Choose a valid vehicle page.")
+    filtered_rows = [row for row in rows if statuses[status_filter] is None or row["status"] == statuses[status_filter]]
+    limit = (len(filtered_rows) or 1) if limit_value == "all" else int(limit_value)
+    page_count = max(1, (len(filtered_rows) + limit - 1) // limit)
+    page_number = min(int(page_value), page_count)
+    offset = (page_number - 1) * limit
+
+    utilization = round(100 * booked_active / len(active_vehicles)) if active_vehicles else None
+    return render_template(
+        "dashboard.html",
+        today=today,
+        total_vehicles=len(vehicles),
+        active_vehicle_count=len(active_vehicles),
+        active_booking_count=len(current),
+        available=available,
+        upcoming_count=len(upcoming),
+        vehicle_rows=filtered_rows[offset:offset + limit],
+        vehicle_status_filter=status_filter,
+        vehicle_limit=limit_value,
+        vehicle_page=page_number,
+        vehicle_page_count=page_count,
+        vehicle_total=len(filtered_rows),
+        vehicle_first=offset + 1 if filtered_rows else 0,
+        vehicle_last=min(offset + limit, len(filtered_rows)),
+        current=current,
+        upcoming=upcoming[:5],
+        utilization=utilization,
+        events=list_recent_booking_events() if session.get("role") == "admin" else None,
+        recent_bookings=(
+            sorted(all_bookings, key=lambda booking: (booking["updated_at"], booking["id"]), reverse=True)[:5]
+            if session.get("role") != "admin" else []
+        ),
+        shortcuts=shortcuts,
+    )
+
+
+# Render the workspace home or a feature section, and display any pending notice once.
 @app.route("/team")
 def team_dashboard(section_override: str | None = None) -> str:
     notice = session.pop("team_notice", "")
@@ -3490,10 +4675,10 @@ def team_dashboard(section_override: str | None = None) -> str:
     section = section_override or request.args.get("section", "home")
     if section == "home":
         destinations = (
-            ("testing", "Testing / Bookings", "Book a vehicle activity and see your submitted bookings.", "Open bookings"),
-            ("automation", "Automation", "Review bookings, choose a checklist, and create Jira tickets.", "Open review"),
-            ("vehicles", "Vehicles", "View and manage vehicle details and active or inactive records.", "Open vehicles"),
-            ("history", "Activity History", "Explore vehicle activities in the grid, timeline, or calendar.", "Open history"),
+            ("testing", "Testing / Bookings", "Book vehicles and track submissions.", "Open bookings"),
+            ("automation", "Automation", "Review bookings and create Jira tickets.", "Open review"),
+            ("vehicles", "Vehicles", "Manage vehicles and their availability.", "Open vehicles"),
+            ("history", "Activity History", "View activity in a grid, timeline or calendar.", "Open history"),
         )
         cards = "".join(
             f'<a class="workspace-card" href="{url_for("team_dashboard", section=key)}">'
@@ -3504,12 +4689,12 @@ def team_dashboard(section_override: str | None = None) -> str:
         if session.get("role") == "admin":
             cards += (
                 f'<a class="workspace-card" href="{url_for("admin_dashboard")}">'
-                '<strong>Admin</strong><span>Manage users, review the access and change log, and change your password.</span>'
+                '<strong>Admin</strong><span>Manage users, settings and logs.</span>'
                 '<span class="workspace-card-action">Open admin &rarr;</span></a>'
             )
         section_content = (
             f'<p class="workspace-welcome">Welcome, {esc(_current_actor())}. Choose where you would like to go.</p>'
-            f'<div class="workspace-grid">{cards}</div>'
+            + _dashboard_section(cards)
         )
     elif section == "testing":
         section_content = _campaign_planner_section() + _my_bookings_section()
@@ -3522,7 +4707,12 @@ def team_dashboard(section_override: str | None = None) -> str:
     else:
         abort(400, description="Choose Home, Testing, Automation, Vehicles, or Activity History.")
     body = notice_html + section_content
-    return render_page("Team Workspace", body)
+    return render_page(
+        "DLCM Planning Hub" if section == "home" else "Team Workspace",
+        body,
+        show_heading=False,
+        dashboard=section == "home",
+    )
 
 
 @app.route("/admin")
@@ -3532,6 +4722,7 @@ def admin_dashboard() -> str:
         ("admin_audit", "Access & Change Log", "Review sign-ins and recorded changes."),
         ("change_password", "Change Password", "Change your admin account password."),
         ("admin_email_settings", "Email Notifications", "Check approver email settings and send a test email."),
+        ("admin_help_settings", "Help Contact", "Set the administrator name shown in Profile help."),
     )
     cards = "".join(
         f'<a class="workspace-card" href="{url_for(endpoint)}">'
@@ -3539,9 +4730,41 @@ def admin_dashboard() -> str:
         '<span class="workspace-card-action">Open &rarr;</span></a>'
         for endpoint, title, description in destinations
     )
-    return render_page("Admin", f'<p class="workspace-welcome">Choose an admin option.</p><div class="workspace-grid">{cards}</div>')
+    return render_page(
+        "Admin",
+        f'<p class="workspace-welcome">Manage access, app settings, and activity records.</p>'
+        f'<div class="workspace-grid admin-grid">{cards}</div>',
+    )
 
 
+@app.route("/admin/help-contact", methods=["GET", "POST"])
+def admin_help_settings() -> tuple[str, int] | str:
+    error = ""
+    name = get_help_contact()
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        try:
+            set_help_contact(name)
+        except ValueError as exc:
+            error = str(exc)
+        else:
+            record_audit_event(_current_actor(), "Updated help contact", f"Contact: {name}")
+            session["help_contact_saved"] = True
+            return redirect(url_for("admin_help_settings"))
+    notice = '<p class="msg" role="status">Help contact saved.</p>' if session.pop("help_contact_saved", False) else ""
+    warning = f'<p class="warn" role="alert">{esc(error)}</p>' if error else ""
+    body = (
+        f'{notice}{warning}<p>This name appears in Profile &rarr; Help for all signed-in users.</p>'
+        f'<form class="card admin-settings" method="post" action="{url_for("admin_help_settings")}">'
+        f'<label for="help-contact">Administrator display name</label>'
+        f'<input id="help-contact" type="text" name="name" value="{esc(name)}" maxlength="80" required>'
+        '<p><button type="submit">Save contact</button></p></form>'
+        f'<p><a href="{url_for("admin_dashboard")}">Back to admin</a></p>'
+    )
+    return render_page("Help Contact", body), 400 if error else 200
+
+
+# Show notification settings and send a test message only on form submission.
 @app.route("/admin/email", methods=["GET", "POST"])
 def admin_email_settings() -> str:
     back = f'<p><a href="{url_for("admin_dashboard")}">Back to admin</a></p>'
@@ -3552,9 +4775,9 @@ def admin_email_settings() -> str:
     if not settings.enabled:
         return render_page(
             "Email Notifications",
-            '<p>Booking notifications are off. Set <code>BOOKING_NOTIFY_TO</code>, <code>MAIL_FROM</code>, and '
+            '<div class="card admin-settings"><p>Booking notifications are off. Set <code>BOOKING_NOTIFY_TO</code>, <code>MAIL_FROM</code>, and '
             '<code>SMTP_HOST</code> (or <code>MAIL_OUTBOX_DIR</code> for local testing) in the app host\'s '
-            '<code>.env</code>, then restart the app.</p>' + back,
+            '<code>.env</code>, then restart the app.</p></div>' + back,
         )
     notice = ""
     if request.method == "POST":
@@ -3585,6 +4808,7 @@ def admin_email_settings() -> str:
     )
 
 
+# Require a section and explicit confirmation before adding a duplicate vehicle name.
 @app.route("/vehicles/create", methods=["POST"])
 def vehicle_create() -> str:
     vehicle_data = {
@@ -3627,12 +4851,13 @@ def vehicle_create() -> str:
     return redirect(url_for("team_dashboard", section="vehicles"))
 
 
+# Offer permanent deletion only if the vehicle has no bookings to preserve.
 def _vehicle_delete_section(vehicle: dict) -> str:
     booking_count = count_vehicle_bookings(vehicle["id"])
     if booking_count:
         body = (
             f'<p class="form-hint">This vehicle has {booking_count} booking(s), so it cannot be deleted. '
-            'To stop using it, choose <strong>Move to inactive</strong> on the Vehicles page instead.</p>'
+            'To stop using it, choose <strong>Move to inactive</strong> in the Vehicles page\'s Inactive vehicles panel instead.</p>'
         )
     else:
         body = (
@@ -3640,9 +4865,10 @@ def _vehicle_delete_section(vehicle: dict) -> str:
             f'onsubmit="return confirm(\'Permanently delete this vehicle? This cannot be undone.\')">'
             f'<button class="danger-button" type="submit">Delete {esc(vehicle["label"])}</button></form>'
         )
-    return f'<div class="card vehicle-delete-card"><h3>Delete vehicle</h3>{body}</div>'
+    return f'<div class="card vehicle-delete-card" id="delete-vehicle"><h3>Delete vehicle</h3>{body}</div>'
 
 
+# Recheck booking history in the store before honoring an admin's delete request.
 @app.route("/vehicles/<int:vehicle_id>/delete", methods=["POST"])
 def admin_vehicle_delete(vehicle_id: int) -> str:
     vehicle = get_vehicle(vehicle_id)
@@ -3663,6 +4889,7 @@ def admin_vehicle_delete(vehicle_id: int) -> str:
     return redirect(url_for("vehicle_management", **show))
 
 
+# Render or save vehicle details, exposing deletion only to admins and auditing changed fields.
 @app.route("/vehicles/<int:vehicle_id>/edit", methods=["GET", "POST"])
 def vehicle_edit(vehicle_id: int) -> str:
     vehicle = get_vehicle(vehicle_id)

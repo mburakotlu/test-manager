@@ -1,0 +1,163 @@
+<main class="dashboard" aria-labelledby="dashboard-title">
+  <header class="dashboard-header">
+    <div>
+      <p class="dashboard-eyebrow">VEHICLE TEST RESOURCES</p>
+      <h1 id="dashboard-title">DLCM Planning Hub</h1>
+      <p>Planning overview <span aria-hidden="true">&middot;</span> {{ today.isoformat() }}</p>
+    </div>
+    <a class="dashboard-primary" href="{{ url_for('team_dashboard', section='testing') }}">+ New booking</a>
+  </header>
+
+  <section class="row g-3 dashboard-kpis" aria-label="Planning summary">
+    {% for label, value, detail, icon in [
+      ('Total Vehicles', total_vehicles, 'All active and inactive vehicles', 'vehicles'),
+      ('Active Bookings', active_booking_count, 'Planned for today', 'bookings'),
+      ('Available Vehicles', available, 'Active, unblocked and unreserved today', 'available'),
+      ('Upcoming Reservations', upcoming_count, 'Starting after today', 'upcoming')
+    ] %}
+    <div class="col-12 col-sm-6 col-xl-3">
+      <div class="dashboard-kpi">
+        <div class="dashboard-kpi-top"><span>{{ label }}</span>
+          <span class="dashboard-icon" aria-hidden="true">
+            {% if icon == 'vehicles' %}<svg viewBox="0 0 24 24"><path d="M4 16h16l-1.5-5h-13L4 16Zm1.5-5 2-4h9l2 4M6 16v2m12-2v2M7 14h.01M17 14h.01"/></svg>
+            {% elif icon == 'bookings' %}<svg viewBox="0 0 24 24"><path d="M4 6h16v14H4zM8 4v4m8-4v4M4 10h16m-12 4h3m-3 3h7"/></svg>
+            {% elif icon == 'available' %}<svg viewBox="0 0 24 24"><path d="M12 3 4 6v5c0 5 3 8 8 10 5-2 8-5 8-10V6l-8-3Zm-4 9 3 3 5-6"/></svg>
+            {% else %}<svg viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 1-8 8m8-5v5l3 2M4 5v4h4"/></svg>{% endif %}
+          </span>
+        </div>
+        <strong>{{ value }}</strong><small>{{ detail }}</small>
+      </div>
+    </div>
+    {% endfor %}
+  </section>
+
+  <section class="dashboard-shortcuts" aria-labelledby="shortcuts-title">
+    <h2 id="shortcuts-title">Workspace</h2>
+    <div class="workspace-grid">{{ shortcuts | safe }}</div>
+  </section>
+
+  <div class="row g-3 dashboard-sections">
+    <div class="col-12 col-xl-8">
+      <section class="dashboard-panel" aria-labelledby="vehicle-status-title">
+        <div class="dashboard-panel-heading">
+          <div><p class="dashboard-eyebrow">FLEET OVERVIEW</p><h2 id="vehicle-status-title">Vehicle Status</h2></div>
+          <a href="{{ url_for('team_dashboard', section='vehicles') }}">Manage vehicles &rarr;</a>
+        </div>
+        <p class="dashboard-caption">Active vehicles, based on today's planned dates. Blocked vehicles show as Not available. In use means the booking is marked In progress.</p>
+        <form class="dashboard-vehicle-filters" method="get" action="{{ url_for('team_dashboard', _anchor='vehicle-status-title') }}">
+          <label for="dashboard-vehicle-status">Status
+            <select id="dashboard-vehicle-status" name="vehicle_status" onchange="this.form.submit()">
+              {% for value, label in [('all', 'All statuses'), ('available', 'Available'), ('reserved', 'Reserved'), ('in_use', 'In use'), ('blocked', 'Blocked / not available')] %}
+              <option value="{{ value }}"{% if vehicle_status_filter == value %} selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label for="dashboard-vehicle-limit">Vehicles per page
+            <select id="dashboard-vehicle-limit" name="vehicle_limit" onchange="this.form.submit()">
+              {% for value, label in [('10', '10'), ('15', '15'), ('25', '25'), ('50', '50'), ('all', 'All')] %}
+              <option value="{{ value }}"{% if vehicle_limit == value %} selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <button type="submit">Apply</button>
+        </form>
+        <div class="dashboard-table-wrap">
+          <table class="dashboard-table">
+            <thead><tr><th>Vehicle ID</th><th>Status</th><th>Current user</th><th>End date</th></tr></thead>
+            <tbody>
+              {% for row in vehicle_rows %}
+              <tr>
+                <td><strong>{{ row.vehicle.label }}</strong></td>
+                <td><span class="dashboard-status status-{{ row.status | lower | replace(' ', '-') }}">{{ row.status }}</span></td>
+                <td>{% for item in row.bookings %}{{ item.booking.created_by }}{% if not loop.last %}<br>{% endif %}{% else %}&mdash;{% endfor %}</td>
+                <td>{% for item in row.bookings %}{{ item.end.isoformat() }}{% if not loop.last %}<br>{% endif %}{% else %}&mdash;{% endfor %}</td>
+              </tr>
+              {% else %}
+              <tr><td colspan="4" class="dashboard-empty">{% if active_vehicle_count %}No vehicles match this status.{% else %}No active vehicles yet.{% endif %}</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="dashboard-vehicle-pagination">
+          <span>{% if vehicle_total %}Showing {{ vehicle_first }}&ndash;{{ vehicle_last }} of {{ vehicle_total }} vehicles{% else %}No vehicles to show{% endif %}</span>
+          {% if vehicle_page_count > 1 %}
+          <div class="dashboard-page-links" role="navigation" aria-label="Vehicle pages">
+            {% if vehicle_page > 1 %}<a href="{{ url_for('team_dashboard', vehicle_status=vehicle_status_filter, vehicle_limit=vehicle_limit, vehicle_page=vehicle_page - 1, _anchor='vehicle-status-title') }}">Previous</a>{% endif %}
+            <span>Page {{ vehicle_page }} of {{ vehicle_page_count }}</span>
+            {% if vehicle_page < vehicle_page_count %}<a href="{{ url_for('team_dashboard', vehicle_status=vehicle_status_filter, vehicle_limit=vehicle_limit, vehicle_page=vehicle_page + 1, _anchor='vehicle-status-title') }}">Next</a>{% endif %}
+          </div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="dashboard-panel" aria-labelledby="schedule-title">
+        <div class="dashboard-panel-heading">
+          <div><p class="dashboard-eyebrow">ON THE CALENDAR</p><h2 id="schedule-title">Today's Schedule</h2></div>
+          <a href="{{ url_for('team_dashboard', section='history', view='calendar') }}">Open calendar &rarr;</a>
+        </div>
+        <p class="dashboard-caption">Activities whose planned dates include today.</p>
+        <div class="dashboard-timeline">
+          {% for item in current %}
+          <div class="dashboard-timeline-item">
+            <span class="dashboard-timeline-dot" aria-hidden="true"></span>
+            <div><strong>{{ item.booking.vehicle_label }}</strong><span>{{ item.booking.activity }} &middot; {{ item.booking.created_by }}</span></div>
+            <time>{{ item.start.isoformat() }}{% if item.end != item.start %} &ndash; {{ item.end.isoformat() }}{% endif %}</time>
+          </div>
+          {% else %}<p class="dashboard-empty">No activities planned for today.</p>{% endfor %}
+        </div>
+      </section>
+    </div>
+    <div class="col-12 col-xl-4">
+      <section class="dashboard-panel" aria-labelledby="upcoming-title">
+        <div class="dashboard-panel-heading"><div><p class="dashboard-eyebrow">PLAN AHEAD</p><h2 id="upcoming-title">Upcoming Reservations</h2></div></div>
+        <p class="dashboard-caption">Next five activities by start date.</p>
+        <div class="dashboard-list">
+          {% for item in upcoming %}
+          <div class="dashboard-list-item">
+            <div><strong>{{ item.booking.vehicle_label }}</strong><span>{{ item.booking.created_by }}</span></div>
+            <time>{{ item.start.isoformat() }}{% if item.end != item.start %}<br>to {{ item.end.isoformat() }}{% endif %}</time>
+          </div>
+          {% else %}<p class="dashboard-empty">No upcoming reservations.</p>{% endfor %}
+        </div>
+      </section>
+      <section class="dashboard-panel" aria-labelledby="utilization-title">
+        <div class="dashboard-panel-heading"><div><p class="dashboard-eyebrow">FLEET CAPACITY</p><h2 id="utilization-title">Utilization</h2></div></div>
+        {% if utilization is not none %}
+        <div class="dashboard-utilization">
+          <div class="dashboard-gauge" style="--usage: {{ utilization }}%" role="img" aria-label="{{ utilization }}% of active vehicles have a booking today"><strong>{{ utilization }}%</strong></div>
+          <p>Active vehicles with a planned booking today<br><small>{{ active_vehicle_count }} active vehicles in total</small></p>
+        </div>
+        {% else %}<p class="dashboard-empty">No active vehicles to calculate utilization.</p>{% endif %}
+        <p class="dashboard-caption">Planned occupancy, not measured physical vehicle usage.</p>
+      </section>
+      <section class="dashboard-panel" aria-labelledby="activity-title">
+        <div class="dashboard-panel-heading">
+          <div><p class="dashboard-eyebrow">LATEST UPDATES</p><h2 id="activity-title">Recent Activity</h2></div>
+          {% if events is not none %}<a href="{{ url_for('admin_audit') }}">Full log &rarr;</a>{% else %}<a href="{{ url_for('team_dashboard', section='automation', status='all') }}">All bookings &rarr;</a>{% endif %}
+        </div>
+        {% if events is none %}
+        <p class="dashboard-caption">Recently updated team bookings and their current status.</p>
+        <div class="dashboard-list">
+          {% for booking in recent_bookings %}
+          <div class="dashboard-list-item">
+            <div><strong>{{ booking.activity }}</strong><span>{{ booking.vehicle_label }} &middot; Booked by {{ booking.created_by }}</span>
+              <span>Current status: {{ booking.status | replace('_', ' ') | title }}</span></div>
+            <time>{{ booking.updated_at[:10] }}</time>
+          </div>
+          {% else %}<p class="dashboard-empty">No bookings yet.</p>{% endfor %}
+        </div>
+        {% else %}
+        <div class="dashboard-list">
+          {% for event in events %}
+          <div class="dashboard-list-item dashboard-event">
+            <div><strong>{{ event.action }}</strong><span>{{ event.actor }}{% if event.details %} &middot; {{ event.details }}{% endif %}</span></div>
+            <time>{{ event.created_at[:10] }}</time>
+          </div>
+          {% else %}<p class="dashboard-empty">No recorded booking activity yet.</p>{% endfor %}
+        </div>
+        {% endif %}
+      </section>
+    </div>
+  </div>
+  <p class="dashboard-footnote">Dates are inclusive. Week-only activities cover Monday to Friday. Rejected bookings are excluded; historical and closed activities still reserve their planned dates. This is planning information, not a live check-in or return record.</p>
+</main>

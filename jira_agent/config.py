@@ -28,6 +28,7 @@ DEFAULT_CHECKLIST_FIELD_ID = "customfield_17802"
 # ARE on the screen and settable via the normal issue API. Verified 2026-09-09.
 VIN_FIELD_ID = "customfield_12602"  # "VIN"
 VEHICLE_DESCRIPTION_FIELD_ID = "customfield_18800"  # "Vehicle description"
+VEHICLE_ASSET_FIELD_ID = "customfield_15815"  # Assets object picker, when enabled on the create screen
 
 # Cascading-select field required by board 114663's saved filter
 # ("Product category" in cascadeOption(337005)) — tickets missing this value never

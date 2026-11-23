@@ -11,6 +11,7 @@ Configuration (environment variables):
 from __future__ import annotations
 
 import os
+import html
 import re
 import smtplib
 import ssl
@@ -82,7 +83,8 @@ def _single_line(value: object, limit: int = 120) -> str:
 
 
 def build_booking_submitted_email(
-    settings: MailSettings, booking: dict, review_url: str, recipients: tuple[str, ...] | None = None
+    settings: MailSettings, booking: dict, review_url: str, recipients: tuple[str, ...] | None = None,
+    *, approve_url: str, reject_url: str,
 ) -> EmailMessage:
     message = EmailMessage()
     message["Subject"] = _single_line(
@@ -107,12 +109,41 @@ def build_booking_submitted_email(
         lines += ["", "Notes:", str(booking["description"]).strip()]
     lines += [
         "",
-        f"Review, edit, approve or reject it here: {review_url}",
+        f"Preview and approve with Jira creation: {approve_url}",
+        f"Preview and reject: {reject_url}",
+        f"Open the review queue: {review_url}",
         "",
-        "Approving a booking does not create a Jira ticket by itself.",
+        "Sign in, review the Jira ticket preview, and confirm to approve and create the ticket.",
+        "The reject link opens a separate confirmation without creating a ticket.",
         "This message was sent automatically by the Vehicle Activity Planner.",
     ]
     message.set_content("\n".join(lines))
+    escape = lambda value: html.escape(str(value), quote=True)
+    details = [
+        ("Booking ID", f"#{booking['id']}"),
+        ("Vehicle", _single_line(booking["vehicle_label"])),
+        ("VIN", _single_line(booking.get("vehicle_vin") or "Not recorded")),
+        ("Activity", _single_line(booking["activity"], 300)),
+        ("Week", _single_line(booking["period"])),
+        ("Date(s)", _single_line(booking.get("date_label") or "Week only")),
+        ("Submitted by", _single_line(booking["created_by"])),
+    ]
+    details_html = "".join(f"<li><strong>{escape(label)}:</strong> {escape(value)}</li>" for label, value in details)
+    notes = (
+        f'<p><strong>Notes:</strong><br>{escape(str(booking["description"]).strip()).replace(chr(10), "<br>")}</p>'
+        if booking.get("description") else ""
+    )
+    message.add_alternative(
+        '<html><body><p>A new vehicle booking is waiting for review.</p>'
+        f'<ul>{details_html}</ul>{notes}'
+        f'<p><a href="{escape(approve_url)}">Preview and approve with Jira creation</a> &nbsp; | &nbsp; '
+        f'<a href="{escape(reject_url)}">Preview and reject</a></p>'
+        f'<p><a href="{escape(review_url)}">Open the review queue</a></p>'
+        '<p>Sign in, review the Jira ticket preview, and confirm to approve and create the ticket. '
+        'The reject link opens a separate confirmation without creating a ticket.</p>'
+        '</body></html>',
+        subtype="html",
+    )
     return message
 
 

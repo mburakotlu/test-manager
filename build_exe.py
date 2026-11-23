@@ -76,13 +76,13 @@ def main() -> None:
         check=True,
     )
 
-    for directory in ("templates",):
+    for directory in ("templates", "static"):
         shutil.copytree(ROOT / directory, OUTPUT / directory)
-    for filename in ("DLCM_FZG_Planung.xlsx", "register.yaml", ".env.example"):
+    for filename in ("DLCM_FZG_Planung.xlsx", "register.yaml"):
         shutil.copy2(ROOT / filename, OUTPUT / filename)
     (OUTPUT / "START_HERE.txt").write_text(
         f"Jira Manager v{APP_VERSION}\n\n"
-        "1. Copy .env.example to .env in this folder.\n"
+        "1. Obtain the approved configuration separately and create .env in this folder; configuration files are not bundled.\n"
         "2. Run JiraManager.exe --generate-secret and put the output in APP_SECRET_KEY in .env.\n"
         "3. Add the automation Jira credentials to .env; keep the token private.\n"
         "4. Run JiraManager.exe --import-workbook to preview, then add --confirm for a one-time import.\n"
